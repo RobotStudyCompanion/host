@@ -1,0 +1,2 @@
+# host
+rsc daemon service
