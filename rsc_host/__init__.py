@@ -1,38 +1,8 @@
-"""rsc_host.hal — hardware abstraction layer.
+"""rsc_host — Robot Study Companion host service.
 
-Peripherals import the abstract bases from this package; concrete backends
-(:mod:`rsc_host.hal.fake`, and later :mod:`rsc_host.hal.pi`) implement them.
+Bridges on-chassis peripherals (servos, NeoPixel ring, arcade button, audio,
+front-panel CYD) to LAN clients over an authenticated WebSocket.
 """
 from __future__ import annotations
 
-from rsc_host.hal.base import (
-    AudioBackend,
-    AudioCallback,
-    Backend,
-    GpioCallback,
-    GpioInputBackend,
-    GpioPwmBackend,
-    RingBackend,
-    SerialBackend,
-    ServoBackend,
-)
-from rsc_host.hal.types import Colour, Edge, GpioEdge
-
-__all__ = [
-    # Lifecycle
-    "Backend",
-    # Peripheral type bases
-    "ServoBackend",
-    "RingBackend",
-    "GpioInputBackend",
-    "GpioPwmBackend",
-    "SerialBackend",
-    "AudioBackend",
-    # Callbacks
-    "GpioCallback",
-    "AudioCallback",
-    # Data types
-    "Colour",
-    "Edge",
-    "GpioEdge",
-]
+__version__ = "0.0.1"
