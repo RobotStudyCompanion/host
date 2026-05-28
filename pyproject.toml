@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rsc-host"
+version = "0.0.1"
+description = "Robot Study Companion — host service. Bridges on-chassis peripherals to LAN clients over an authenticated WebSocket."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Robot Study Companion contributors" }]
+keywords = ["robotics", "raspberry-pi", "websocket", "rsc"]
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pyserial>=3.5",
+    "sounddevice>=0.4.7",
+]
+
+[project.optional-dependencies]
+# Pi-only — keeps `pip install rsc-host` working on dev laptops where these
+# can't build. On the Pi: `pip install rsc-host[pi]`.
+pi = [
+    "pigpio>=1.78",
+    "rpi_ws281x>=5.0.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+rsc-host = "rsc_host.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rsc_host"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
