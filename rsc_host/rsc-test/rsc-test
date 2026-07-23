@@ -1,0 +1,10 @@
+#!/bin/bash
+# /usr/local/bin/rsc-test
+# RSC hardware test rig launcher.
+# Usage: rsc-test [subsystem] [subtest]
+#        rsc-test --check
+
+VENV_DIR="/home/rsc/rsc-env"
+SCRIPT="/home/rsc/rsc/rsc_test.py"
+
+exec sudo "${VENV_DIR}/bin/python3" "${SCRIPT}" "$@"
