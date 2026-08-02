@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rsc-host console</title>
+<style>
+    :root {
+        --bg: #0e0e12;
+        --panel: #1a1a22;
+        --panel-hi: #24242e;
+        --fg: #e6e6ea;
+        --fg-dim: #8a8a99;
+        --accent: #6a9dff;
+        --ok: #7ed491;
+        --err: #ff8080;
+        --warn: #ffb266;
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.4 system-ui, -apple-system, sans-serif;
+        display: grid;
+        grid-template-columns: 380px 1fr;
+        grid-template-rows: auto 1fr;
+        grid-template-areas:
+            "header header"
+            "controls log";
+        height: 100vh;
+    }
+    header {
+        grid-area: header;
+        padding: 12px 20px;
+        border-bottom: 1px solid var(--panel-hi);
+        display: flex;
+        gap: 12px;
+        align-items: center;
+    }
+    header input, header button {
+        padding: 6px 10px;
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--panel-hi);
+        border-radius: 6px;
+        font: inherit;
+    }
+    header input:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+    header button { cursor: pointer; }
+    header button:hover { background: var(--panel-hi); }
+    header .status {
+        margin-left: auto;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-family: var(--mono);
+        font-size: 12px;
+    }
+    header .status.disconnected { background: rgba(255, 128, 128, 0.15); color: var(--err); }
+    header .status.connected    { background: rgba(126, 212, 145, 0.15); color: var(--ok); }
+    header .status.connecting   { background: rgba(255, 178, 102, 0.15); color: var(--warn); }
+    .controls {
+        grid-area: controls;
+        padding: 16px 20px;
+        overflow-y: auto;
+        border-right: 1px solid var(--panel-hi);
+    }
+    .controls h2 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--fg-dim);
+        margin: 20px 0 8px;
+    }
+    .controls h2:first-child { margin-top: 0; }
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+    }
+    button.action {
+        padding: 10px 12px;
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--panel-hi);
+        border-radius: 6px;
+        font: inherit;
+        cursor: pointer;
+        text-align: left;
+    }
+    button.action:hover { background: var(--panel-hi); border-color: var(--accent); }
+    button.action:active { transform: translateY(1px); }
+    button.action[disabled] { opacity: 0.4; cursor: not-allowed; }
+    .verb-row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 6px;
+    }
+    .verb-row input {
+        flex: 1;
+        padding: 8px 10px;
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--panel-hi);
+        border-radius: 6px;
+        font: 13px var(--mono);
+    }
+    .verb-row button { padding: 8px 12px; }
+    .log {
+        grid-area: log;
+        padding: 16px 20px;
+        overflow-y: auto;
+        font: 13px var(--mono);
+    }
+    .log .entry {
+        padding: 4px 8px;
+        border-left: 3px solid transparent;
+        margin-bottom: 2px;
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+    .log .entry.sent  { border-left-color: var(--accent); color: var(--fg-dim); }
+    .log .entry.ack   { border-left-color: var(--ok);     color: var(--fg); }
+    .log .entry.err   { border-left-color: var(--err);    color: var(--err); }
+    .log .entry.event { border-left-color: var(--warn);   color: var(--fg); }
+    .log .entry.info  { border-left-color: var(--fg-dim); color: var(--fg-dim); }
+    .log .ts { color: var(--fg-dim); margin-right: 8px; }
+    .clear-btn {
+        position: sticky;
+        top: 0;
+        background: var(--bg);
+        padding-bottom: 8px;
+        margin: -16px -20px 8px;
+        padding: 8px 20px;
+        border-bottom: 1px solid var(--panel-hi);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+</style>
+</head>
+<body>
+
+<header>
+    <input id="host" placeholder="your-robot.local" value="" size="20" autocomplete="off">
+    <input id="port" placeholder="port" value="8765" size="6">
+    <input id="token" placeholder="token" value="" size="12" type="password">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <span id="status" class="status disconnected">disconnected</span>
+</header>
+
+<div class="controls">
+    <h2>Baseline</h2>
+    <div class="grid">
+        <button class="action" data-verb="ping">ping</button>
+        <button class="action" data-verb="status">status</button>
+    </div>
+
+    <h2>Flippers</h2>
+    <div class="grid">
+        <button class="action" data-verb="flipper.left" data-args='{"speed":0.5,"ramp_ms":300}'>left fwd 0.5</button>
+        <button class="action" data-verb="flipper.left" data-args='{"speed":-0.5,"ramp_ms":300}'>left rev 0.5</button>
+        <button class="action" data-verb="flipper.left.stop">left stop</button>
+        <button class="action" data-verb="flipper.right" data-args='{"speed":0.5,"ramp_ms":300}'>right fwd 0.5</button>
+        <button class="action" data-verb="flipper.right" data-args='{"speed":-0.5,"ramp_ms":300}'>right rev 0.5</button>
+        <button class="action" data-verb="flipper.right.stop">right stop</button>
+    </div>
+
+    <h2>Ring</h2>
+    <div class="grid">
+        <button class="action" data-verb="ring.mode" data-args='{"mode":"off"}'>off</button>
+        <button class="action" data-verb="ring.mode" data-args='{"mode":"solid","params":{"r":0,"g":80,"b":255}}'>solid blue</button>
+        <button class="action" data-verb="ring.mode" data-args='{"mode":"pulse","params":{"r":80,"g":0,"b":80,"period_ms":1500}}'>pulse purple</button>
+        <button class="action" data-verb="ring.mode" data-args='{"mode":"spin","params":{"r":0,"g":80,"b":255,"period_ms":1500}}'>spin blue</button>
+        <button class="action" data-verb="ring.modes">list modes</button>
+    </div>
+
+    <h2>Arcade LED</h2>
+    <div class="grid">
+        <button class="action" data-verb="button_led" data-args='{"mode":"off"}'>off</button>
+        <button class="action" data-verb="button_led" data-args='{"mode":"on"}'>on</button>
+        <button class="action" data-verb="button_led" data-args='{"mode":"pulse"}'>pulse</button>
+        <button class="action" data-verb="button_led" data-args='{"mode":"breathe"}'>breathe</button>
+    </div>
+
+    <h2>CYD front panel</h2>
+    <div class="grid">
+        <button class="action" data-verb="cyd.mood" data-args='{"value":"HAPPY"}'>mood: HAPPY</button>
+        <button class="action" data-verb="cyd.mood" data-args='{"value":"SAD"}'>mood: SAD</button>
+        <button class="action" data-verb="cyd.blink">blink</button>
+        <button class="action" data-verb="cyd.mood_cycle">mood_cycle</button>
+    </div>
+
+    <h2>Audio</h2>
+    <div class="grid">
+        <button class="action" data-verb="audio.devices">devices</button>
+        <button class="action" data-verb="audio.stop_play">stop play</button>
+    </div>
+
+    <h2>Custom verb</h2>
+    <div class="verb-row">
+        <input id="customVerb" placeholder="verb (e.g. cyd.mood)">
+        <button id="customSend">send</button>
+    </div>
+    <div class="verb-row">
+        <input id="customArgs" placeholder='args JSON (e.g. {"value":"HAPPY"})'>
+    </div>
+
+    <h2>Events</h2>
+    <div class="grid">
+        <button class="action" id="historyBtn">history (last 20)</button>
+    </div>
+</div>
+
+<div class="log" id="log">
+    <div class="clear-btn">
+        <span>event log</span>
+        <button id="clearBtn">clear</button>
+    </div>
+</div>
+
+<script>
+let ws = null;
+let cmdCounter = 0;
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const logEl = $("log");
+
+function setStatus(state, text) {
+    statusEl.className = "status " + state;
+    statusEl.textContent = text;
+    $("connectBtn").disabled = (state === "connected" || state === "connecting");
+    $("disconnectBtn").disabled = (state !== "connected");
+}
+
+function log(kind, text) {
+    const entry = document.createElement("div");
+    entry.className = "entry " + kind;
+    const ts = new Date().toLocaleTimeString();
+    entry.innerHTML = `<span class="ts">${ts}</span>${text.replace(/</g, "&lt;")}`;
+    logEl.appendChild(entry);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+function send(verb, args) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("err", "not connected");
+        return;
+    }
+    const id = "c" + (++cmdCounter);
+    const msg = { type: "cmd", id, verb, args: args || {} };
+    ws.send(JSON.stringify(msg));
+    log("sent", `→ ${verb}  ${JSON.stringify(args || {})}`);
+}
+
+$("connectBtn").addEventListener("click", () => {
+    const host = $("host").value.trim();
+    const port = $("port").value.trim();
+    const token = $("token").value;
+    const url = `ws://${host}:${port}/`;
+
+    setStatus("connecting", `connecting to ${host}...`);
+    log("info", `opening ${url}`);
+
+    try {
+        ws = new WebSocket(url, ["bearer", token]);
+    } catch (exc) {
+        log("err", `WebSocket construction failed: ${exc.message}`);
+        setStatus("disconnected", "disconnected");
+        return;
+    }
+
+    ws.onopen = () => {
+        setStatus("connected", "connected");
+        log("info", `connected (subprotocol: ${ws.protocol})`);
+    };
+
+    ws.onmessage = (evt) => {
+        let msg;
+        try {
+            msg = JSON.parse(evt.data);
+        } catch {
+            log("err", `bad JSON: ${evt.data}`);
+            return;
+        }
+        if (msg.type === "ack") {
+            if (msg.ok) {
+                log("ack", `← [${msg.id}] ok  ${JSON.stringify(msg.result ?? {})}`);
+            } else {
+                log("err", `← [${msg.id}] ${msg.code}: ${msg.message}`);
+            }
+        } else if (msg.type === "event") {
+            const seq = msg.seq != null ? `#${msg.seq} ` : "";
+            log("event", `⇢ ${seq}${msg.source}:${msg.topic}  ${JSON.stringify(msg.data)}`);
+        } else {
+            log("info", `unknown: ${evt.data}`);
+        }
+    };
+
+    ws.onerror = () => {
+        log("err", "socket error");
+    };
+
+    ws.onclose = (evt) => {
+        setStatus("disconnected", "disconnected");
+        log("info", `closed (code=${evt.code}, reason=${evt.reason || "-"})`);
+        ws = null;
+    };
+});
+
+$("disconnectBtn").addEventListener("click", () => {
+    if (ws) ws.close();
+});
+
+$("clearBtn").addEventListener("click", () => {
+    logEl.querySelectorAll(".entry").forEach(e => e.remove());
+});
+
+// Preset verb buttons
+document.querySelectorAll("button.action[data-verb]").forEach(btn => {
+    btn.addEventListener("click", () => {
+        const verb = btn.dataset.verb;
+        let args = {};
+        if (btn.dataset.args) {
+            try { args = JSON.parse(btn.dataset.args); }
+            catch (exc) { log("err", `bad preset args: ${exc.message}`); return; }
+        }
+        send(verb, args);
+    });
+});
+
+// Custom verb
+$("customSend").addEventListener("click", () => {
+    const verb = $("customVerb").value.trim();
+    const argsRaw = $("customArgs").value.trim();
+    if (!verb) return;
+    let args = {};
+    if (argsRaw) {
+        try { args = JSON.parse(argsRaw); }
+        catch (exc) { log("err", `bad JSON args: ${exc.message}`); return; }
+    }
+    send(verb, args);
+});
+
+// History replay
+$("historyBtn").addEventListener("click", () => {
+    send("events.history", { limit: 20 });
+});
+
+// Initial state
+setStatus("disconnected", "disconnected");
+
+// URL-fragment prefill: rsc.ee/console.html#rsc-shiny
+// or rsc.ee/console.html#rsc-shiny:8765
+// The token is never accepted from the URL — must be entered manually.
+if (location.hash) {
+    const raw = decodeURIComponent(location.hash.slice(1));
+    const [host, port] = raw.split(":");
+    if (host) $("host").value = host.endsWith(".local") ? host : host + ".local";
+    if (port) $("port").value = port;
+    log("info", `prefilled from URL fragment: ${host}${port ? ":" + port : ""}`);
+    log("info", "enter your token above and hit Connect");
+} else {
+    log("info", "enter your robot's hostname (e.g. rsc-shiny.local) and token, then Connect");
+    log("info", "tip: bookmark rsc.ee/console.html#your-robot to prefill next time");
+}
+</script>
+</body>
+</html>

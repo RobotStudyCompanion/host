@@ -108,6 +108,10 @@ class Event(BaseModel):
     Events are fire-and-forget — no correlation ID, no ack. Sources are bounded
     to 'host' (events the host itself emits — peripheral state, button edges,
     versioning) and 'cyd' (events ingested from the front-panel UART).
+
+    ``seq`` is a monotonic sequence number assigned by the event bus at publish
+    time. Clients use it to request replay of missed events on reconnect.
+    Set to ``None`` on events constructed client-side (not yet published).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -119,3 +123,7 @@ class Event(BaseModel):
         description="'cyd' for events ingested from the front-panel UART; 'host' otherwise.",
     )
     data: dict[str, Any] = Field(default_factory=dict)
+    seq: int | None = Field(
+        default=None,
+        description="Monotonic sequence number, assigned by the event bus at publish.",
+    )

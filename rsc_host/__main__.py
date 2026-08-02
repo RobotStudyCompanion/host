@@ -51,6 +51,29 @@ async def _ping(_args: _EmptyArgs) -> dict:
     return {"pong": True}
 
 
+class _HistoryArgs(BaseModel):
+    since_seq: int | None = None
+    limit: int | None = None
+    topic: str | None = None
+
+
+@verb("events.history", args_model=_HistoryArgs)
+async def _events_history(args: _HistoryArgs) -> dict:
+    """Replay recent events from the bus's ring buffer.
+
+    Returns ``{"events": [...], "latest_seq": N}``. Events are ordered
+    oldest → newest. Filtered by ``since_seq`` (only events with
+    ``seq >= since_seq``) and/or ``topic`` (exact match).
+    """
+    events = default_bus.history(since_seq=args.since_seq, limit=args.limit)
+    if args.topic is not None:
+        events = [e for e in events if e.topic == args.topic]
+    return {
+        "events": [e.model_dump(mode="json") for e in events],
+        "latest_seq": default_bus.latest_seq(),
+    }
+
+
 # ---- Bootstrap ----
 
 

@@ -117,6 +117,15 @@ class TestEvent:
         e = Event(topic="x", source="host")
         assert e.data == {}
 
+    def test_default_seq_none(self) -> None:
+        e = Event(topic="x", source="host")
+        assert e.seq is None
+
+    def test_seq_roundtrip(self) -> None:
+        original = Event(topic="x", source="host", seq=42)
+        parsed = Event.model_validate_json(original.model_dump_json())
+        assert parsed.seq == 42
+
 
 class TestErrorCode:
     def test_codes_serialise_as_strings(self) -> None:
