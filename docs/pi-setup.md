@@ -69,12 +69,78 @@ sudo usermod -aG gpio,spi,audio,dialout,i2c pi
 
 Log out and back in, or reboot, for the group membership to take effect.
 
-## 5. Install the host package
+## 5. Get the code onto the Pi (Syncthing)
+
+Two options: **git clone** (simple, one-shot) or **Syncthing** (auto-updates
+as you edit on your laptop — worth setting up if you'll iterate).
+
+### Option A — git clone (one-shot)
 
 ```bash
 cd ~
 git clone https://github.com/RobotStudyCompanion/host.git
-cd host
+```
+
+Skip to section 6.
+
+### Option B — Syncthing (auto-sync from laptop)
+
+Install and enable as a user service — runs under your login, not root, so
+synced files land with the right ownership.
+
+```bash
+sudo apt install -y syncthing
+sudo systemctl enable --now syncthing@$USER.service
+sudo systemctl status syncthing@$USER.service   # active (running)?
+```
+
+Syncthing binds its GUI to `127.0.0.1:8384` — safe, but unreachable from the
+laptop directly. Open a tunnel from the laptop:
+
+```bash
+# On the laptop, in a spare terminal — leave it running
+ssh -L 8384:127.0.0.1:8384 <your-pi-host>
+```
+
+Browse to `http://127.0.0.1:8384` on the laptop; you're now looking at the
+Pi's Syncthing GUI. It will prompt for an admin username/password on first
+load — set it.
+
+Pair the devices:
+
+* On the Pi's GUI: **Actions → Show ID.** Copy the device ID.
+* On the laptop (run Syncthing there too if you haven't): same, **Actions →
+  Show ID.**
+* On the Pi's GUI: **Add Remote Device**, paste the laptop's ID, save.
+* On the laptop's GUI: accept the incoming device prompt.
+
+Share the host/ folder:
+
+* On the laptop: **Add Folder.** Path = wherever `host/` lives locally,
+  label "host", share with the Pi.
+* On the Pi's GUI: accept the shared folder prompt, set path to `/home/$USER/host`.
+
+**Ignore patterns** — set on both sides (Folder → Edit → Ignore Patterns):
+
+```
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.stfolder
+.stversions
+```
+
+The Python virtualenv is platform-specific binaries — syncing it would break
+things. The others are caches; syncing them just wastes traffic.
+
+Within 30 s files appear in `/home/$USER/host` on the Pi.
+
+## 6. Install the host package
+
+```bash
+cd ~/host
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[pi]"
@@ -105,7 +171,7 @@ INFO rsc_host.server: host serving on ws://0.0.0.0:8765
 Ctrl-C to stop. If any backend fails, the log will name the specific one —
 usually a pin conflict, missing group membership, or pigpiod not running.
 
-## 6. Install the systemd unit
+## 7. Install the systemd unit
 
 The unit is a *template* (`rsc-host@.service`); the `%i` after the `@`
 picks up the username at enable time.
@@ -133,7 +199,7 @@ sudo systemctl status rsc-host@pi.service
 journalctl -u rsc-host@pi.service -f
 ```
 
-## 7. Reboot to confirm boot-order behaviour
+## 8. Reboot to confirm boot-order behaviour
 
 ```bash
 sudo reboot
@@ -148,7 +214,7 @@ systemctl status pigpiod rsc-host@pi.service
 Both should be active. `rsc-host` will have started *after* `pigpiod` per
 the `After=` and `Requires=` directives in the unit.
 
-## 8. Safe-restart behaviour
+## 9. Safe-restart behaviour
 
 * If `pigpiod` dies, systemd restarts it, then restarts `rsc-host` (because
   it `Requires=` pigpiod). No manual intervention.
