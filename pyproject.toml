@@ -13,8 +13,7 @@ authors = [{ name = "Robot Study Companion contributors" }]
 keywords = ["robotics", "raspberry-pi", "websocket", "rsc"]
 
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    "websockets>=13",
     "pydantic>=2.7",
     "pyserial>=3.5",
     "sounddevice>=0.4.7",
