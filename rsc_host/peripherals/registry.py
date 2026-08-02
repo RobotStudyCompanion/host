@@ -73,6 +73,20 @@ class Pinout:
     m3_enabled: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class AudioConfig:
+    """Audio device / format settings.
+
+    Passed through to :class:`~rsc_host.hal.pi.PiAudioBackend` (ignored by
+    the fake). Defaults are voice-assistant standard.
+    """
+
+    input_device:  str | int | None = None   # ALSA default
+    output_device: str | int | None = None   # ALSA default
+    samplerate: int = 16000
+    channels: int = 1
+
+
 @dataclass
 class Peripherals:
     """Handle to running peripherals; used for lifecycle management."""
@@ -124,7 +138,7 @@ class Peripherals:
 
 
 def _build_backends(
-    backend: str, pinout: Pinout
+    backend: str, pinout: Pinout, audio_config: AudioConfig
 ) -> tuple[
     ServoBackend, RingBackend, GpioInputBackend, GpioPwmBackend, SerialBackend, AudioBackend
 ]:
@@ -160,7 +174,12 @@ def _build_backends(
             PiGpioInputBackend(pins=[pinout.button_pin]),
             PiGpioPwmBackend(pins=[pinout.button_led_pin]),
             PiSerialBackend(),
-            PiAudioBackend(),
+            PiAudioBackend(
+                input_device=audio_config.input_device,
+                output_device=audio_config.output_device,
+                samplerate=audio_config.samplerate,
+                channels=audio_config.channels,
+            ),
         )
     raise ValueError(f"unknown backend: {backend!r}")
 
@@ -216,13 +235,15 @@ async def setup(
     bus: EventBus,
     backend: str = "fake",
     pinout: Pinout | None = None,
+    audio_config: AudioConfig | None = None,
 ) -> Peripherals:
     """Build backends + peripherals, register verbs, start everything."""
     pinout = pinout or Pinout()
+    audio_config = audio_config or AudioConfig()
 
     # Backends
     servo_be, ring_be, gpio_in_be, gpio_pwm_be, serial_be, audio_be = _build_backends(
-        backend, pinout
+        backend, pinout, audio_config
     )
     for be in (servo_be, ring_be, gpio_in_be, gpio_pwm_be, serial_be, audio_be):
         await be.start()
@@ -326,6 +347,10 @@ async def setup(
     async def _audio_capture_stop(_args: _EmptyArgs) -> dict:
         await audio.stop_capture()
         return {}
+
+    @dispatcher.verb("audio.devices", args_model=_EmptyArgs)
+    async def _audio_devices(_args: _EmptyArgs) -> dict:
+        return await audio_be.list_devices()
 
     log.info(
         "peripherals ready: backend=%s, ring_modes=%s, cyd_verbs=%d",

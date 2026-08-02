@@ -53,6 +53,7 @@ class TestVerbRegistration:
         assert "audio.play_url" in verbs
         assert "audio.stop_play" in verbs
         assert "audio.capture.stop" in verbs
+        assert "audio.devices" in verbs
 
 
 class TestEndToEnd:
@@ -99,6 +100,14 @@ class TestEndToEnd:
             evt = await asyncio.wait_for(q.get(), timeout=1.0)
         assert evt.topic == "host_vol"
         assert evt.data == {"value": 88}
+
+    async def test_audio_devices_returns_shape(self, rig) -> None:
+        from rsc_host.protocol import Cmd
+        dispatcher, _, _ = rig
+        ack = await dispatcher.dispatch(Cmd(id="cd", verb="audio.devices", args={}))
+        assert ack.ok is True
+        assert "input" in ack.result and "output" in ack.result
+        assert "default_input" in ack.result and "default_output" in ack.result
 
 
 class TestM3Disabled:

@@ -15,6 +15,13 @@ Environment=RSC_HOST_BIND=0.0.0.0
 Environment=RSC_HOST_PORT=8765
 Environment=RSC_HOST_LOG_LEVEL=INFO
 Environment=GPIOZERO_PIN_FACTORY=pigpio
+# Audio — leave unset to use ALSA defaults, or override to pin a device.
+# Values can be an integer index (e.g. 1) or a name substring (e.g. "USB").
+# Use `rsc-host-audio-check` on the Pi to see available devices.
+# Environment=RSC_HOST_AUDIO_INPUT=1
+# Environment=RSC_HOST_AUDIO_OUTPUT=1
+# Environment=RSC_HOST_AUDIO_SAMPLERATE=16000
+# Environment=RSC_HOST_AUDIO_CHANNELS=1
 ExecStart=/home/%i/host/.venv/bin/python -m rsc_host
 
 # Safe restart: crash / hardware hiccup / pigpiod restart → we come back too.

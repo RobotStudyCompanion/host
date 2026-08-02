@@ -19,7 +19,7 @@ from rsc_host.config import Config, load_from_env
 from rsc_host.discovery import DiscoveryInfo, ServiceAdvertiser, resolve_robot_name
 from rsc_host.dispatch import default_dispatcher, verb
 from rsc_host.events import default_bus
-from rsc_host.peripherals.registry import setup as setup_peripherals
+from rsc_host.peripherals.registry import AudioConfig, setup as setup_peripherals
 from rsc_host.server import Server, build_ssl_context
 
 log = logging.getLogger(__name__)
@@ -77,8 +77,16 @@ async def _run(config: Config) -> None:
 
     # Boot peripherals BEFORE the server, so verbs are registered and the
     # arcade button's edge callback is live before any client can connect.
+    audio_config = AudioConfig(
+        input_device=config.audio_input,
+        output_device=config.audio_output,
+        samplerate=config.audio_samplerate,
+        channels=config.audio_channels,
+    )
     peripherals = await setup_peripherals(
-        default_dispatcher, default_bus, backend=config.backend
+        default_dispatcher, default_bus,
+        backend=config.backend,
+        audio_config=audio_config,
     )
 
     server = Server(

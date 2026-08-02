@@ -41,6 +41,7 @@ dev = [
 
 [project.scripts]
 rsc-host = "rsc_host.__main__:main"
+rsc-host-audio-check = "rsc_host.cli.audio_check:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rsc_host"]

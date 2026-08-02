@@ -302,6 +302,15 @@ class FakeAudio(AudioBackend):
         self._streamed: list[dict] = []
         self._capture_callback: AudioCallback | None = None
         self._running = False
+        self._devices: dict = {
+            "input":  [{"index": 0, "name": "Fake Mic",     "channels": 1, "samplerate": 16000}],
+            "output": [{"index": 0, "name": "Fake Speaker", "channels": 2, "samplerate": 48000}],
+            "default_input":  0,
+            "default_output": 0,
+        }
+
+    async def list_devices(self) -> dict:
+        return dict(self._devices)
 
     async def start(self) -> None:
         self._running = True
@@ -360,6 +369,10 @@ class FakeAudio(AudioBackend):
         Each entry: ``{samplerate, channels, sample_width, chunks, total_bytes}``.
         """
         return tuple(self._streamed)
+
+    def inject_devices(self, devices: dict) -> None:
+        """Test hook: override the device list returned by :meth:`list_devices`."""
+        self._devices = dict(devices)
 
     def is_capturing(self) -> bool:
         return self._capture_callback is not None

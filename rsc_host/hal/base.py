@@ -187,6 +187,23 @@ class AudioBackend(Backend):
     """
 
     @abc.abstractmethod
+    async def list_devices(self) -> dict:
+        """Return currently enumerated audio devices.
+
+        Shape::
+
+            {
+                "input":  [{"index": 0, "name": "...", "channels": 2, "samplerate": 44100}, ...],
+                "output": [{"index": 0, "name": "...", "channels": 2, "samplerate": 48000}, ...],
+                "default_input":  0,
+                "default_output": 0,
+            }
+
+        Useful for clients that want to let users pick a device without
+        needing shell access to the Pi.
+        """
+
+    @abc.abstractmethod
     async def play_wav(self, wav_bytes: bytes) -> None:
         """Play a WAV-encoded payload through the default output device.
         Awaits playback completion."""

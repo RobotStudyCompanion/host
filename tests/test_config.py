@@ -19,6 +19,10 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "RSC_HOST_LOG_LEVEL",
         "RSC_HOST_ADVERTISE",
         "RSC_HOST_ROBOT_NAME",
+        "RSC_HOST_AUDIO_INPUT",
+        "RSC_HOST_AUDIO_OUTPUT",
+        "RSC_HOST_AUDIO_SAMPLERATE",
+        "RSC_HOST_AUDIO_CHANNELS",
     ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
@@ -49,6 +53,10 @@ class TestDefaults:
         assert cfg.log_level == "INFO"
         assert cfg.advertise is True
         assert cfg.robot_name is None
+        assert cfg.audio_input is None
+        assert cfg.audio_output is None
+        assert cfg.audio_samplerate == 16000
+        assert cfg.audio_channels == 1
 
 
 class TestBackend:
@@ -140,3 +148,47 @@ class TestAdvertise:
     def test_robot_name_default_none(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
         assert load_from_env().robot_name is None
+
+
+class TestAudio:
+    def test_input_as_integer(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_INPUT", "2")
+        assert load_from_env().audio_input == 2
+
+    def test_input_as_string_name(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_INPUT", "USB Microphone")
+        assert load_from_env().audio_input == "USB Microphone"
+
+    def test_output_defaults_none(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        assert load_from_env().audio_output is None
+
+    def test_samplerate_custom(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_SAMPLERATE", "48000")
+        assert load_from_env().audio_samplerate == 48000
+
+    def test_samplerate_invalid(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_SAMPLERATE", "not-a-number")
+        with pytest.raises(ValueError, match="AUDIO_SAMPLERATE"):
+            load_from_env()
+
+    def test_samplerate_negative(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_SAMPLERATE", "-8000")
+        with pytest.raises(ValueError, match="AUDIO_SAMPLERATE"):
+            load_from_env()
+
+    def test_channels_stereo(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_CHANNELS", "2")
+        assert load_from_env().audio_channels == 2
+
+    def test_channels_invalid(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_AUDIO_CHANNELS", "5")
+        with pytest.raises(ValueError, match="AUDIO_CHANNELS"):
+            load_from_env()

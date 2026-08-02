@@ -171,6 +171,49 @@ INFO rsc_host.server: host serving on ws://0.0.0.0:8765
 Ctrl-C to stop. If any backend fails, the log will name the specific one —
 usually a pin conflict, missing group membership, or pigpiod not running.
 
+### Audio device selection
+
+By default the daemon uses the ALSA default input and output. To pin a
+specific device — useful when a USB mic and an audio HAT coexist, or the
+HAT itself needs override — list what's available:
+
+```bash
+rsc-host-audio-check
+```
+
+Sample output:
+
+```
+Default input:  0
+Default output: 0
+
+idx  in   out  rate     name
+------------------------------------------------------------
+0    2*   2*   48000    seeed2micvoicec: - (hw:0,0)
+1    1    0    44100    USB PnP Sound Device: (hw:1,0)
+2    0    2    48000    HDMI 0: (hw:2,0)
+```
+
+The `*` marks the current default. To use device 1 for input and 2 for
+output, set the env vars (in the shell for a foreground run, or in the
+systemd unit for the service):
+
+```bash
+export RSC_HOST_AUDIO_INPUT=1
+export RSC_HOST_AUDIO_OUTPUT=2
+export RSC_HOST_AUDIO_SAMPLERATE=16000
+```
+
+Values can be integer indices or name substrings (e.g. ``USB PnP`` matches
+device 1 above).
+
+Smoke-test a specific device before pointing the daemon at it:
+
+```bash
+rsc-host-audio-check --test-play 2                 # beep on output 2
+rsc-host-audio-check --test-record 1 --sec 3       # record 3s from input 1
+```
+
 ## 7. Install the systemd unit
 
 The unit is a *template* (`rsc-host@.service`); the `%i` after the `@`

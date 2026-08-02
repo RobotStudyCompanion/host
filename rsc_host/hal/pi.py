@@ -470,6 +470,38 @@ class PiAudioBackend(AudioBackend):
         self._loop = None
         log.info("PiAudioBackend stopped")
 
+    async def list_devices(self) -> dict:
+        """Enumerate ALSA/PortAudio devices via sounddevice.query_devices()."""
+        import sounddevice as sd
+
+        def _query() -> dict:
+            devices = sd.query_devices()
+            default_input, default_output = sd.default.device
+            inputs: list[dict] = []
+            outputs: list[dict] = []
+            for i, d in enumerate(devices):
+                entry_common = {
+                    "index": i,
+                    "name": d["name"],
+                    "samplerate": int(d["default_samplerate"]),
+                }
+                if d["max_input_channels"] > 0:
+                    inputs.append(
+                        {**entry_common, "channels": d["max_input_channels"]}
+                    )
+                if d["max_output_channels"] > 0:
+                    outputs.append(
+                        {**entry_common, "channels": d["max_output_channels"]}
+                    )
+            return {
+                "input":  inputs,
+                "output": outputs,
+                "default_input":  default_input,
+                "default_output": default_output,
+            }
+
+        return await asyncio.to_thread(_query)
+
     async def play_wav(self, wav_bytes: bytes) -> None:
         """Play a WAV payload. Blocks in a worker thread; awaits completion."""
         import io

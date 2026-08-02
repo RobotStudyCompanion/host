@@ -321,3 +321,24 @@ class TestFakeAudio:
 
         await a.stream_pcm(gen(), samplerate=16000, channels=1)
         assert a.streamed()[0]["total_bytes"] == 0
+
+    async def test_list_devices_default_shape(self) -> None:
+        a = FakeAudio()
+        devs = await a.list_devices()
+        assert "input" in devs and "output" in devs
+        assert "default_input" in devs and "default_output" in devs
+        assert isinstance(devs["input"], list)
+        # Default fake has one input and one output.
+        assert len(devs["input"]) == 1
+        assert len(devs["output"]) == 1
+
+    async def test_inject_devices_hook(self) -> None:
+        a = FakeAudio()
+        custom = {
+            "input":  [{"index": 0, "name": "Fake USB", "channels": 1, "samplerate": 48000}],
+            "output": [],
+            "default_input": 0,
+            "default_output": -1,
+        }
+        a.inject_devices(custom)
+        assert await a.list_devices() == custom

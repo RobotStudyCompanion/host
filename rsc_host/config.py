@@ -5,15 +5,21 @@ Env-var driven; sensible defaults for laptop development. Production deployment
 
 Variables:
 
-    RSC_HOST_BIND         Interface to bind (default: 127.0.0.1)
-    RSC_HOST_PORT         TCP port (default: 8765)
-    RSC_HOST_TOKEN        Bearer token — REQUIRED, no default in prod
-    RSC_HOST_BACKEND      HAL backend: fake | pi (default: fake)
-    RSC_HOST_TLS_CERT     PEM cert path; enables TLS if set
-    RSC_HOST_TLS_KEY      PEM key path; enables TLS if set
-    RSC_HOST_LOG_LEVEL    Python log level (default: INFO)
-    RSC_HOST_ADVERTISE    LAN mDNS discovery: true | false (default: true)
-    RSC_HOST_ROBOT_NAME   Override the advertised name (default: hostname)
+    RSC_HOST_BIND               Interface to bind (default: 127.0.0.1)
+    RSC_HOST_PORT               TCP port (default: 8765)
+    RSC_HOST_TOKEN              Bearer token — REQUIRED, no default in prod
+    RSC_HOST_BACKEND            HAL backend: fake | pi (default: fake)
+    RSC_HOST_TLS_CERT           PEM cert path; enables TLS if set
+    RSC_HOST_TLS_KEY            PEM key path; enables TLS if set
+    RSC_HOST_LOG_LEVEL          Python log level (default: INFO)
+    RSC_HOST_ADVERTISE          LAN mDNS discovery: true | false (default: true)
+    RSC_HOST_ROBOT_NAME         Override the advertised name (default: hostname)
+    RSC_HOST_AUDIO_INPUT        ALSA input device — int index or name string
+                                (default: ALSA default)
+    RSC_HOST_AUDIO_OUTPUT       ALSA output device — int index or name string
+                                (default: ALSA default)
+    RSC_HOST_AUDIO_SAMPLERATE   Capture rate in Hz (default: 16000)
+    RSC_HOST_AUDIO_CHANNELS     Capture channels (default: 1)
 
 The token has no default: laptop dev must set ``RSC_HOST_TOKEN=dev``
 explicitly. This prevents accidental production runs with a guessable secret.
@@ -40,6 +46,10 @@ class Config:
     log_level: str
     advertise: bool
     robot_name: str | None
+    audio_input: str | int | None
+    audio_output: str | int | None
+    audio_samplerate: int
+    audio_channels: int
 
     @property
     def tls_enabled(self) -> bool:
@@ -85,6 +95,43 @@ def load_from_env() -> Config:
 
     robot_name = os.environ.get("RSC_HOST_ROBOT_NAME", "").strip() or None
 
+    # Audio device: accept either an integer index (0, 1, ...) or a name
+    # substring (e.g. "USB Microphone", "seeed"). An empty value means
+    # "use ALSA default".
+    def _parse_device(varname: str) -> str | int | None:
+        raw = os.environ.get(varname, "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+
+    audio_input = _parse_device("RSC_HOST_AUDIO_INPUT")
+    audio_output = _parse_device("RSC_HOST_AUDIO_OUTPUT")
+
+    try:
+        audio_samplerate = int(os.environ.get("RSC_HOST_AUDIO_SAMPLERATE", "16000"))
+    except ValueError as exc:
+        raise ValueError(
+            f"RSC_HOST_AUDIO_SAMPLERATE must be an integer: {exc}"
+        ) from exc
+    if audio_samplerate <= 0:
+        raise ValueError(
+            f"RSC_HOST_AUDIO_SAMPLERATE must be > 0, got {audio_samplerate}"
+        )
+
+    try:
+        audio_channels = int(os.environ.get("RSC_HOST_AUDIO_CHANNELS", "1"))
+    except ValueError as exc:
+        raise ValueError(
+            f"RSC_HOST_AUDIO_CHANNELS must be an integer: {exc}"
+        ) from exc
+    if audio_channels not in (1, 2):
+        raise ValueError(
+            f"RSC_HOST_AUDIO_CHANNELS must be 1 or 2, got {audio_channels}"
+        )
+
     return Config(
         bind=os.environ.get("RSC_HOST_BIND", "127.0.0.1").strip(),
         port=int(os.environ.get("RSC_HOST_PORT", "8765")),
@@ -95,4 +142,8 @@ def load_from_env() -> Config:
         log_level=os.environ.get("RSC_HOST_LOG_LEVEL", "INFO").strip().upper(),
         advertise=advertise,
         robot_name=robot_name,
+        audio_input=audio_input,
+        audio_output=audio_output,
+        audio_samplerate=audio_samplerate,
+        audio_channels=audio_channels,
     )
