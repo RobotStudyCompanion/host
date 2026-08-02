@@ -17,6 +17,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "RSC_HOST_TLS_CERT",
         "RSC_HOST_TLS_KEY",
         "RSC_HOST_LOG_LEVEL",
+        "RSC_HOST_ADVERTISE",
+        "RSC_HOST_ROBOT_NAME",
     ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
@@ -45,6 +47,8 @@ class TestDefaults:
         assert cfg.tls_key is None
         assert cfg.tls_enabled is False
         assert cfg.log_level == "INFO"
+        assert cfg.advertise is True
+        assert cfg.robot_name is None
 
 
 class TestBackend:
@@ -104,3 +108,35 @@ class TestOverrides:
         clean_env.setenv("RSC_HOST_LOG_LEVEL", "debug")
         cfg = load_from_env()
         assert cfg.log_level == "DEBUG"
+
+
+class TestAdvertise:
+    def test_advertise_default_true(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        assert load_from_env().advertise is True
+
+    def test_advertise_false(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_ADVERTISE", "false")
+        assert load_from_env().advertise is False
+
+    def test_advertise_various_true_values(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        for v in ("true", "TRUE", "1", "yes"):
+            clean_env.setenv("RSC_HOST_ADVERTISE", v)
+            assert load_from_env().advertise is True
+
+    def test_advertise_invalid_rejected(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_ADVERTISE", "maybe")
+        with pytest.raises(ValueError, match="RSC_HOST_ADVERTISE"):
+            load_from_env()
+
+    def test_robot_name_override(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        clean_env.setenv("RSC_HOST_ROBOT_NAME", "Shiny")
+        assert load_from_env().robot_name == "Shiny"
+
+    def test_robot_name_default_none(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("RSC_HOST_TOKEN", "dev")
+        assert load_from_env().robot_name is None

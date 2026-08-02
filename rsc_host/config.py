@@ -12,6 +12,8 @@ Variables:
     RSC_HOST_TLS_CERT     PEM cert path; enables TLS if set
     RSC_HOST_TLS_KEY      PEM key path; enables TLS if set
     RSC_HOST_LOG_LEVEL    Python log level (default: INFO)
+    RSC_HOST_ADVERTISE    LAN mDNS discovery: true | false (default: true)
+    RSC_HOST_ROBOT_NAME   Override the advertised name (default: hostname)
 
 The token has no default: laptop dev must set ``RSC_HOST_TOKEN=dev``
 explicitly. This prevents accidental production runs with a guessable secret.
@@ -36,6 +38,8 @@ class Config:
     tls_cert: str | None
     tls_key: str | None
     log_level: str
+    advertise: bool
+    robot_name: str | None
 
     @property
     def tls_enabled(self) -> bool:
@@ -72,6 +76,15 @@ def load_from_env() -> Config:
             "or both unset."
         )
 
+    advertise_raw = os.environ.get("RSC_HOST_ADVERTISE", "true").strip().lower()
+    if advertise_raw not in ("true", "false", "1", "0", "yes", "no"):
+        raise ValueError(
+            f"RSC_HOST_ADVERTISE must be true/false, got {advertise_raw!r}"
+        )
+    advertise = advertise_raw in ("true", "1", "yes")
+
+    robot_name = os.environ.get("RSC_HOST_ROBOT_NAME", "").strip() or None
+
     return Config(
         bind=os.environ.get("RSC_HOST_BIND", "127.0.0.1").strip(),
         port=int(os.environ.get("RSC_HOST_PORT", "8765")),
@@ -80,4 +93,6 @@ def load_from_env() -> Config:
         tls_cert=tls_cert,
         tls_key=tls_key,
         log_level=os.environ.get("RSC_HOST_LOG_LEVEL", "INFO").strip().upper(),
+        advertise=advertise,
+        robot_name=robot_name,
     )

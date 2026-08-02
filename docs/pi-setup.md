@@ -17,8 +17,21 @@ sudo apt install -y \
     pigpio python3-pigpio \
     git \
     libportaudio2 \
-    build-essential
+    build-essential \
+    avahi-daemon
 ```
+
+Give the Pi a friendly name — this doubles as its network identity and its
+advertised name over mDNS.
+
+```bash
+sudo hostnamectl set-hostname Shiny        # or Pinky, Minion, rsc-01, ...
+sudo systemctl enable --now avahi-daemon
+```
+
+After a reboot the Pi is reachable at `Shiny.local` from any machine on the
+LAN (Linux, macOS, Windows 10+). The daemon additionally advertises itself
+as ``_rsc-host._tcp.local`` for zero-config client discovery.
 
 ## 2. Enable UART for the CYD front panel
 

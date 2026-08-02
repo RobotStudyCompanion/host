@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from rsc_host import __version__
 from rsc_host.auth import TokenAuth
 from rsc_host.config import Config, load_from_env
+from rsc_host.discovery import DiscoveryInfo, ServiceAdvertiser, resolve_robot_name
 from rsc_host.dispatch import default_dispatcher, verb
 from rsc_host.events import default_bus
 from rsc_host.peripherals.registry import setup as setup_peripherals
@@ -97,10 +98,26 @@ async def _run(config: Config) -> None:
             pass  # Windows: no signal handlers on the loop
 
     await server.start()
+
+    # LAN discovery — best effort, non-fatal on failure.
+    advertiser: ServiceAdvertiser | None = None
+    if config.advertise:
+        robot_name = config.robot_name or resolve_robot_name()
+        advertiser = ServiceAdvertiser(
+            DiscoveryInfo(
+                robot_name=robot_name,
+                port=config.port,
+                tls=config.tls_enabled,
+            )
+        )
+        await advertiser.start()
+
     try:
         await shutdown.wait()
     finally:
         log.info("shutdown requested; stopping")
+        if advertiser is not None:
+            await advertiser.stop()
         await server.stop()
         await peripherals.stop()
 
