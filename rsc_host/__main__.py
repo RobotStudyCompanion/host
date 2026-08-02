@@ -13,6 +13,7 @@ import sys
 from pydantic import BaseModel
 
 from rsc_host import __version__
+from rsc_host.audio_endpoints import build_audio_in_handler, build_audio_out_handler
 from rsc_host.auth import TokenAuth
 from rsc_host.config import Config, load_from_env
 from rsc_host.discovery import DiscoveryInfo, ServiceAdvertiser, resolve_robot_name
@@ -88,6 +89,11 @@ async def _run(config: Config) -> None:
         port=config.port,
         ssl_context=ssl_ctx,
     )
+
+    # Binary audio endpoints. Path routing lives in Server; the handlers here
+    # own the connection lifecycle for their path.
+    server.add_path_handler("/audio/out", build_audio_out_handler(peripherals.audio))
+    server.add_path_handler("/audio/in", build_audio_in_handler(peripherals.audio))
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()

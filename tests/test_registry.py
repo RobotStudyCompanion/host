@@ -47,6 +47,13 @@ class TestVerbRegistration:
         assert "cyd.mood" in verbs
         assert "cyd.raw" in verbs
 
+    async def test_audio_verbs_registered(self, rig) -> None:
+        dispatcher, _, _ = rig
+        verbs = set(dispatcher.registered_verbs())
+        assert "audio.play_url" in verbs
+        assert "audio.stop_play" in verbs
+        assert "audio.capture.stop" in verbs
+
 
 class TestEndToEnd:
     async def test_flipper_verb_moves_backend(self, rig) -> None:

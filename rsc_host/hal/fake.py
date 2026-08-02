@@ -299,6 +299,7 @@ class FakeAudio(AudioBackend):
 
     def __init__(self) -> None:
         self._played: list[bytes] = []
+        self._streamed: list[dict] = []
         self._capture_callback: AudioCallback | None = None
         self._running = False
 
@@ -315,6 +316,32 @@ class FakeAudio(AudioBackend):
         self._played.append(wav_bytes)
         log.debug("FakeAudio play_wav: %d bytes", len(wav_bytes))
 
+    async def stream_pcm(
+        self,
+        pcm_chunks,
+        *,
+        samplerate: int,
+        channels: int,
+        sample_width: int = 2,
+    ) -> None:
+        # Accumulate chunks for test inspection; capture the format params.
+        chunks: list[bytes] = []
+        async for chunk in pcm_chunks:
+            chunks.append(chunk)
+        self._streamed.append(
+            {
+                "samplerate": samplerate,
+                "channels": channels,
+                "sample_width": sample_width,
+                "chunks": chunks,
+                "total_bytes": sum(len(c) for c in chunks),
+            }
+        )
+        log.debug(
+            "FakeAudio stream_pcm: %d chunks / %d bytes @ %d Hz",
+            len(chunks), sum(len(c) for c in chunks), samplerate,
+        )
+
     async def start_capture(self, callback: AudioCallback) -> None:
         self._capture_callback = callback
 
@@ -326,6 +353,13 @@ class FakeAudio(AudioBackend):
     def played(self) -> tuple[bytes, ...]:
         """All payloads that have been played, in order."""
         return tuple(self._played)
+
+    def streamed(self) -> tuple[dict, ...]:
+        """All PCM streams that have been submitted, in order.
+
+        Each entry: ``{samplerate, channels, sample_width, chunks, total_bytes}``.
+        """
+        return tuple(self._streamed)
 
     def is_capturing(self) -> bool:
         return self._capture_callback is not None

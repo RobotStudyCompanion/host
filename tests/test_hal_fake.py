@@ -293,3 +293,31 @@ class TestFakeAudio:
         await a.start_capture(lambda _f: None)
         await a.stop_capture()
         await a.stop_capture()  # second stop also safe
+
+    async def test_stream_pcm_records_chunks_and_params(self) -> None:
+        a = FakeAudio()
+
+        async def gen():
+            yield b"aaa"
+            yield b"bbb"
+            yield b"cccc"
+
+        await a.stream_pcm(gen(), samplerate=48000, channels=1, sample_width=2)
+        streams = a.streamed()
+        assert len(streams) == 1
+        s = streams[0]
+        assert s["samplerate"] == 48000
+        assert s["channels"] == 1
+        assert s["sample_width"] == 2
+        assert s["chunks"] == [b"aaa", b"bbb", b"cccc"]
+        assert s["total_bytes"] == 10
+
+    async def test_stream_pcm_empty_iterator(self) -> None:
+        a = FakeAudio()
+
+        async def gen():
+            if False:
+                yield b""  # never runs
+
+        await a.stream_pcm(gen(), samplerate=16000, channels=1)
+        assert a.streamed()[0]["total_bytes"] == 0

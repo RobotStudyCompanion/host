@@ -41,6 +41,7 @@ from rsc_host.hal.fake import (
     FakeSerial,
     FakeServo,
 )
+from rsc_host.peripherals.audio import Audio
 from rsc_host.peripherals.button import ArcadeButton
 from rsc_host.peripherals.button_led import ButtonLed
 from rsc_host.peripherals.cyd import CydBridge, curated_cyd_verbs
@@ -90,9 +91,12 @@ class Peripherals:
     button: ArcadeButton
     button_led: ButtonLed
     cyd: CydBridge
+    audio: Audio
 
     async def stop(self) -> None:
         """Stop peripherals in reverse order of construction, then backends."""
+        await self.audio.stop_capture()
+        await self.audio.stop_play()
         await self.cyd.stop()
         await self.ring.stop()
         await self.button_led.stop()
@@ -195,6 +199,11 @@ class _CydRawArgs(BaseModel):
     line: str
 
 
+class _AudioPlayUrlArgs(BaseModel):
+    url: str
+    preempt: bool = False
+
+
 class _EmptyArgs(BaseModel):
     pass
 
@@ -227,6 +236,7 @@ async def setup(
     button = ArcadeButton(pinout.button_pin, gpio_in_be, bus)
     button_led = ButtonLed(pinout.button_led_pin, gpio_pwm_be, bus)
     cyd = CydBridge(serial_be, bus)
+    audio = Audio(audio_be, bus)
 
     await button.start()
     await cyd.start()
@@ -290,6 +300,33 @@ async def setup(
         await cyd.send_raw(args.line)
         return {"line": args.line}
 
+    # ---- Audio verbs ----
+
+    @dispatcher.verb("audio.play_url", args_model=_AudioPlayUrlArgs)
+    async def _audio_play_url(args: _AudioPlayUrlArgs) -> dict:
+        # Fetch and play. Kept simple: download whole file, then play.
+        # Streaming from URL directly to the sink is a later refinement.
+        import urllib.request
+        def _fetch() -> bytes:
+            with urllib.request.urlopen(args.url, timeout=10) as resp:
+                return resp.read()
+        try:
+            wav_bytes = await asyncio.to_thread(_fetch)
+        except Exception as exc:
+            raise ValueError(f"failed to fetch {args.url}: {exc}") from exc
+        await audio.play(wav_bytes, preempt=args.preempt)
+        return {"bytes": len(wav_bytes)}
+
+    @dispatcher.verb("audio.stop_play", args_model=_EmptyArgs)
+    async def _audio_stop_play(_args: _EmptyArgs) -> dict:
+        await audio.stop_play()
+        return {}
+
+    @dispatcher.verb("audio.capture.stop", args_model=_EmptyArgs)
+    async def _audio_capture_stop(_args: _EmptyArgs) -> dict:
+        await audio.stop_capture()
+        return {}
+
     log.info(
         "peripherals ready: backend=%s, ring_modes=%s, cyd_verbs=%d",
         backend,
@@ -311,4 +348,5 @@ async def setup(
         button=button,
         button_led=button_led,
         cyd=cyd,
+        audio=audio,
     )

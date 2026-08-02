@@ -20,7 +20,7 @@ in between; peripherals don't need to know about init order.
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable
+from collections.abc import AsyncIterable, Callable
 
 from rsc_host.hal.types import Colour, GpioEdge
 
@@ -180,15 +180,38 @@ AudioCallback = Callable[[bytes], None]
 class AudioBackend(Backend):
     """Local audio I/O on whichever host runs the backend.
 
-    The HAL is intentionally narrow — *one* local device, play whole payloads,
-    capture into a callback. Multi-sink routing (local + LAN stream) is a
-    peripheral concern that composes this backend with the network layer.
+    The HAL is intentionally narrow — *one* local device, play whole payloads
+    or stream them, capture into a callback. Multi-sink routing (local + LAN
+    stream) is a peripheral concern that composes this backend with the
+    network layer.
     """
 
     @abc.abstractmethod
     async def play_wav(self, wav_bytes: bytes) -> None:
         """Play a WAV-encoded payload through the default output device.
         Awaits playback completion."""
+
+    @abc.abstractmethod
+    async def stream_pcm(
+        self,
+        pcm_chunks: "AsyncIterable[bytes]",
+        *,
+        samplerate: int,
+        channels: int,
+        sample_width: int = 2,
+    ) -> None:
+        """Stream raw PCM chunks to the output device with low latency.
+
+        Playback begins as soon as the first chunk arrives; the backend does
+        not buffer the whole stream. Awaits completion (until the async
+        iterator is exhausted or cancelled).
+
+        Args:
+            pcm_chunks:   async iterator yielding raw PCM byte chunks.
+            samplerate:   Hz (e.g. 48000).
+            channels:     1 (mono) or 2 (stereo).
+            sample_width: bytes per sample (default 2 for s16le).
+        """
 
     @abc.abstractmethod
     async def start_capture(self, callback: AudioCallback) -> None:

@@ -1,22 +1,21 @@
 """WebSocket server tying dispatch, the event bus, and auth to the wire.
 
-One WebSocket endpoint. Each connection:
+Three WebSocket endpoints on one port:
 
-1. **Authenticates on handshake.** The bearer token is presented in
-   ``Sec-WebSocket-Protocol: bearer, <token>``. Bad tokens are rejected
-   before the socket is even accepted.
-2. **Runs two concurrent tasks** for its lifetime:
-   * **rx** — reads JSON messages, validates as :class:`Cmd`, dispatches,
-     sends the :class:`Ack` back.
-   * **tx** — pulls from a fresh :class:`EventBus` subscription, serialises
-     each :class:`Event`, and writes it to the socket.
-3. **Cleans up** the moment either task ends (client disconnect, protocol
-   error, cancellation).
+  * ``/``           — JSON control channel (cmd/ack/event). One per client.
+  * ``/audio/out``  — client → server. Binary WAV chunks concatenated into
+                       one clip; playback begins after the client closes the
+                       stream. Requires the same bearer auth.
+  * ``/audio/in``   — server → client. Binary PCM frames from the current
+                       capture session. Closed by the server when capture
+                       ends, or by the client to end the session early.
 
-The rx loop's error-handling philosophy matches the dispatcher's: never crash
-the connection over a client-side malformation — reply with a failure
-:class:`Ack` and keep going. Server-side bugs *do* propagate up; we'd rather
-notice them than paper over them.
+Extra handlers register via :meth:`Server.add_path_handler`. The audio
+peripheral wires its two handlers this way — keeps ``server.py`` transport-
+only, no audio-specific code here.
+
+Each connection still authenticates on handshake (bearer token via
+``Sec-WebSocket-Protocol``). Path routing happens after auth.
 """
 from __future__ import annotations
 
@@ -37,6 +36,8 @@ from rsc_host.events import EventBus
 from rsc_host.protocol import Ack, Cmd, ErrorCode, Event
 
 log = logging.getLogger(__name__)
+
+PathHandler = Callable[[ServerConnection], Awaitable[None]]
 
 
 class Server:
@@ -63,6 +64,26 @@ class Server:
         self._port = port
         self._ssl = ssl_context
         self._server: websockets.asyncio.server.Server | None = None
+        self._path_handlers: dict[str, PathHandler] = {}
+
+    # ---- Extension ----
+
+    def add_path_handler(self, path: str, handler: PathHandler) -> None:
+        """Register ``handler`` for connections whose request path is ``path``.
+
+        Handlers are called after auth, with an authenticated
+        :class:`ServerConnection`. They own the connection until they return.
+
+        Raises:
+            ValueError: if ``path`` is already registered or is ``'/'``
+                        (reserved for the JSON control channel).
+        """
+        if path == "/":
+            raise ValueError("path '/' is reserved for the JSON control channel")
+        if path in self._path_handlers:
+            raise ValueError(f"path handler already registered: {path!r}")
+        self._path_handlers[path] = handler
+        log.debug("registered path handler: %s", path)
 
     # ---- Lifecycle ----
 
@@ -143,31 +164,48 @@ class Server:
     # ---- Per-connection loop ----
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
-        """One connection: run rx + tx concurrently until either finishes."""
+        """Route to path-specific handler, or fall through to JSON control."""
         peer = ws.remote_address
-        log.info("client connected: %s", peer)
+        path = ws.request.path if ws.request else "/"
+        log.info("client connected: %s path=%s", peer, path)
 
+        try:
+            # Path routing: extension handlers take precedence for their paths;
+            # everything else runs the standard JSON control loop.
+            handler = self._path_handlers.get(path)
+            if handler is not None:
+                try:
+                    await handler(ws)
+                except ConnectionClosed:
+                    pass
+                except Exception:
+                    log.exception("path handler failed: path=%s peer=%s", path, peer)
+                return
+
+            await self._json_control_loop(ws)
+        finally:
+            log.info("client disconnected: %s path=%s", peer, path)
+
+    async def _json_control_loop(self, ws: ServerConnection) -> None:
+        """Standard JSON control channel: rx dispatches cmds, tx broadcasts events."""
         async with self._bus.subscribe() as queue:
+            peer = ws.remote_address
             rx_task = asyncio.create_task(self._rx_loop(ws), name=f"rx-{peer}")
             tx_task = asyncio.create_task(
                 self._tx_loop(ws, queue), name=f"tx-{peer}"
             )
             try:
-                # Wait for whichever finishes first. Client disconnects almost
-                # always surface on rx; tx completes only on cancellation.
                 done, pending = await asyncio.wait(
                     {rx_task, tx_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
                     task.cancel()
-                # Drain cancellations; ignore exceptions from tasks we cancelled.
                 for task in pending:
                     try:
                         await task
                     except (asyncio.CancelledError, Exception):
                         pass
-                # Surface any exception the finished task raised so we log it.
                 for task in done:
                     exc = task.exception()
                     if exc is not None and not isinstance(exc, ConnectionClosed):
@@ -175,8 +213,8 @@ class Server:
                             "connection task failed",
                             exc_info=exc,
                         )
-            finally:
-                log.info("client disconnected: %s", peer)
+            except Exception:
+                log.exception("json control loop failed")
 
     async def _rx_loop(self, ws: ServerConnection) -> None:
         """Read messages, dispatch, send Acks. Never exits on client-side errors."""

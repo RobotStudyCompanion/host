@@ -483,6 +483,62 @@ class PiAudioBackend(AudioBackend):
 
         await asyncio.to_thread(_play)
 
+    async def stream_pcm(
+        self,
+        pcm_chunks,
+        *,
+        samplerate: int,
+        channels: int,
+        sample_width: int = 2,
+    ) -> None:
+        """Stream raw PCM chunks straight to the output — no whole-file buffering.
+
+        Uses sounddevice's RawOutputStream (blocking API) driven from a worker
+        thread. We push chunks into a thread-safe queue that the worker
+        consumes; the worker exits when it sees the sentinel.
+        """
+        import queue as _q
+        import sounddevice as sd
+
+        if sample_width != 2:
+            raise NotImplementedError(
+                f"sample_width={sample_width} not supported yet; only s16le (2)"
+            )
+
+        # Bounded queue: chunks pile up here briefly if the mic pushes faster
+        # than the sink drains. 32 chunks at 20 ms each = ~640 ms tolerated.
+        pcm_queue: _q.Queue[bytes | None] = _q.Queue(maxsize=32)
+
+        def _writer() -> None:
+            """Runs in a worker thread; owns the ALSA stream."""
+            with sd.RawOutputStream(
+                samplerate=samplerate,
+                channels=channels,
+                dtype="int16",
+                device=self._output_device,
+            ) as stream:
+                while True:
+                    chunk = pcm_queue.get()
+                    if chunk is None:  # sentinel: end of stream
+                        return
+                    stream.write(chunk)
+
+        writer_task = asyncio.create_task(asyncio.to_thread(_writer))
+
+        try:
+            async for chunk in pcm_chunks:
+                # to_thread here so the put() doesn't block the event loop
+                # if the queue is full — cheap enough at these rates.
+                await asyncio.to_thread(pcm_queue.put, chunk)
+        finally:
+            # Signal end-of-stream and wait for the writer to drain.
+            await asyncio.to_thread(pcm_queue.put, None)
+            try:
+                await writer_task
+            except Exception:
+                log.exception("stream_pcm writer failed")
+                raise
+
     async def start_capture(self, callback: AudioCallback) -> None:
         import sounddevice as sd
 
