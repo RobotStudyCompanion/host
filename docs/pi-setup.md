@@ -216,30 +216,41 @@ rsc-host-audio-check --test-record 1 --sec 3       # record 3s from input 1
 
 ## 7. Install the systemd unit
 
-The unit is a *template* (`rsc-host@.service`); the `%i` after the `@`
-picks up the username at enable time.
+Use the bundled installer — handles capability grants, unit installation, and
+token setup in one go. Run from the repo root with your venv active:
 
 ```bash
-sudo cp ~/host/systemd/rsc-host@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# Set a real token before enabling; the shipped default is CHANGE_ME.
-sudo systemctl edit rsc-host@pi.service
+source .venv/bin/activate
+./scripts/install-systemd.sh
 ```
 
-In the editor, add:
+The script will:
 
-```ini
-[Service]
-Environment=RSC_HOST_TOKEN=<your-real-token>
-```
+* Grant `cap_sys_rawio` + `cap_dac_override` + `cap_sys_nice` to the venv's
+  Python (needed for NeoPixel `/dev/mem` access).
+* Install the unit template at `/etc/systemd/system/rsc-host@.service`.
+* Prompt for a bearer token (or generate one) and store it in a systemd
+  drop-in at `/etc/systemd/system/rsc-host@$USER.service.d/token.conf`
+  (chmod 600).
+* Enable and start `rsc-host@$USER.service`.
+* Print status and useful commands.
 
-Save, then:
+Save the token somewhere safe — clients need it to connect.
+
+To edit config after install:
 
 ```bash
-sudo systemctl enable --now rsc-host@pi.service
-sudo systemctl status rsc-host@pi.service
-journalctl -u rsc-host@pi.service -f
+sudo systemctl edit rsc-host@$USER.service    # add extra Environment= lines
+sudo systemctl restart rsc-host@$USER.service
+```
+
+Common commands:
+
+```bash
+sudo systemctl status  rsc-host@$USER.service
+sudo systemctl restart rsc-host@$USER.service
+sudo systemctl stop    rsc-host@$USER.service
+journalctl -u rsc-host@$USER.service -f       # live logs
 ```
 
 ## 8. Reboot to confirm boot-order behaviour

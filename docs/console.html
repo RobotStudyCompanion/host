@@ -141,10 +141,12 @@
 <body>
 
 <header>
-    <input id="host" placeholder="your-robot.local" value="" size="20" autocomplete="off">
+    <input id="host" list="known-robots" placeholder="your-robot.local" value="" size="20" autocomplete="off">
+    <datalist id="known-robots"></datalist>
     <input id="port" placeholder="port" value="8765" size="6">
     <input id="token" placeholder="token" value="" size="12" type="password">
     <button id="connectBtn">Connect</button>
+    <button id="scanBtn" title="Try to reach common RSC hostnames on the LAN">Scan</button>
     <button id="disconnectBtn" disabled>Disconnect</button>
     <span id="status" class="status disconnected">disconnected</span>
 </header>
@@ -227,6 +229,44 @@ const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
 const logEl = $("log");
 
+// ---- Known-robots persistence ----
+
+const STORAGE_KEY = "rsc.known_robots";
+const TOKEN_KEY_PREFIX = "rsc.token."; // one entry per host
+
+function loadKnownRobots() {
+    try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    } catch {
+        return [];
+    }
+}
+
+function saveKnownRobot(host) {
+    const known = new Set(loadKnownRobots());
+    known.add(host);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...known].sort()));
+    populateDatalist();
+}
+
+function loadTokenFor(host) {
+    return localStorage.getItem(TOKEN_KEY_PREFIX + host) || "";
+}
+
+function saveTokenFor(host, token) {
+    if (token) localStorage.setItem(TOKEN_KEY_PREFIX + host, token);
+}
+
+function populateDatalist() {
+    const list = $("known-robots");
+    list.innerHTML = "";
+    for (const host of loadKnownRobots()) {
+        const opt = document.createElement("option");
+        opt.value = host;
+        list.appendChild(opt);
+    }
+}
+
 function setStatus(state, text) {
     statusEl.className = "status " + state;
     statusEl.textContent = text;
@@ -256,8 +296,20 @@ function send(verb, args) {
 
 $("connectBtn").addEventListener("click", () => {
     const host = $("host").value.trim();
-    const port = $("port").value.trim();
+    const port = $("port").value.trim() || "8765";
     const token = $("token").value;
+
+    if (!host) {
+        log("err", "enter a hostname (e.g. rsc-shiny.local)");
+        $("host").focus();
+        return;
+    }
+    if (!token) {
+        log("err", "enter your token (from the Pi's install-systemd.sh output)");
+        $("token").focus();
+        return;
+    }
+
     const url = `ws://${host}:${port}/`;
 
     setStatus("connecting", `connecting to ${host}...`);
@@ -274,6 +326,8 @@ $("connectBtn").addEventListener("click", () => {
     ws.onopen = () => {
         setStatus("connected", "connected");
         log("info", `connected (subprotocol: ${ws.protocol})`);
+        saveKnownRobot(host);
+        saveTokenFor(host, token);
     };
 
     ws.onmessage = (evt) => {
@@ -317,6 +371,90 @@ $("clearBtn").addEventListener("click", () => {
     logEl.querySelectorAll(".entry").forEach(e => e.remove());
 });
 
+// ---- Scan for RSCs on the LAN ----
+//
+// Browsers can't do real mDNS, so we probe candidate hostnames by opening
+// a WebSocket without a token — a running rsc-host replies with 401
+// (which the browser reports as a specific close code) very quickly.
+// A dead host times out or refuses. Either signal identifies it.
+
+const SCAN_CANDIDATES = [
+    // Common RSC names
+    "rsc-shiny", "rsc-pinky", "rsc-minion",
+    // Numbered fleet convention
+    "rsc-01", "rsc-02", "rsc-03",
+    // Un-prefixed friendly names
+    "shiny", "pinky", "minion",
+];
+
+async function probe(host, port, timeoutMs = 1500) {
+    // Try a WebSocket handshake; if the daemon is there it either
+    // - accepts (unlikely without a token, but count as "found") or
+    // - rejects with 401 fast (the definitive "yes, something is here").
+    // Dead hosts hang until browser timeout; we short-circuit at timeoutMs.
+    return new Promise((resolve) => {
+        let done = false;
+        const url = `ws://${host}:${port}/`;
+        let sock;
+        try {
+            sock = new WebSocket(url, ["bearer", "probe"]);
+        } catch {
+            resolve(false);
+            return;
+        }
+        const finish = (found) => {
+            if (done) return;
+            done = true;
+            try { sock.close(); } catch {}
+            resolve(found);
+        };
+        // The 401 close arrives fast; any close within timeout with a
+        // reason-code >= 1000 means we found *something* HTTP-responding.
+        sock.onopen = () => finish(true);
+        sock.onclose = (evt) => {
+            // Any clean close from the peer suggests a real HTTP server
+            // (as opposed to a timeout / connection refused).
+            finish(evt.code >= 1000 && evt.code < 5000 && evt.wasClean !== undefined);
+        };
+        sock.onerror = () => {}; // errors are expected for unreachable hosts
+        setTimeout(() => finish(false), timeoutMs);
+    });
+}
+
+$("scanBtn").addEventListener("click", async () => {
+    const port = $("port").value.trim() || "8765";
+    const candidates = new Set([
+        ...loadKnownRobots().map(h => h.replace(/\.local$/, "")),
+        ...SCAN_CANDIDATES,
+    ]);
+    log("info", `scanning ${candidates.size} candidate hostnames on port ${port}...`);
+    $("scanBtn").disabled = true;
+
+    const found = [];
+    // Fire probes in parallel — the browser handles the concurrency fine.
+    await Promise.all(
+        [...candidates].map(async (name) => {
+            const host = `${name}.local`;
+            const hit = await probe(host, port);
+            if (hit) {
+                found.push(host);
+                log("ack", `found: ${host}`);
+                saveKnownRobot(host);
+            }
+        })
+    );
+
+    if (found.length === 0) {
+        log("err", "no RSCs found. Try typing the hostname manually.");
+    } else if (found.length === 1) {
+        log("info", `found ${found[0]}. Type your token and hit Connect.`);
+        $("host").value = found[0];
+    } else {
+        log("info", `found ${found.length} robots — pick one from the dropdown`);
+    }
+    $("scanBtn").disabled = false;
+});
+
 // Preset verb buttons
 document.querySelectorAll("button.action[data-verb]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -350,6 +488,18 @@ $("historyBtn").addEventListener("click", () => {
 
 // Initial state
 setStatus("disconnected", "disconnected");
+populateDatalist();
+
+// When the host input changes to a known robot, prefill its saved token.
+$("host").addEventListener("input", () => {
+    const host = $("host").value.trim();
+    if (!host) return;
+    const saved = loadTokenFor(host);
+    if (saved && !$("token").value) {
+        $("token").value = saved;
+        log("info", `prefilled saved token for ${host}`);
+    }
+});
 
 // URL-fragment prefill: rsc.ee/console.html#rsc-shiny
 // or rsc.ee/console.html#rsc-shiny:8765

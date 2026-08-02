@@ -4,6 +4,8 @@ Documentation=https://github.com/RobotStudyCompanion/host
 After=network-online.target pigpiod.service
 Wants=network-online.target
 Requires=pigpiod.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -27,8 +29,6 @@ ExecStart=/home/%i/host/.venv/bin/python -m rsc_host
 # Safe restart: crash / hardware hiccup / pigpiod restart → we come back too.
 Restart=on-failure
 RestartSec=2
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 # Group membership required for GPIO / SPI / audio / serial access.
 SupplementaryGroups=gpio spi audio dialout i2c
