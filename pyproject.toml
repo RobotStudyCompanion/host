@@ -25,6 +25,11 @@ dependencies = [
 pi = [
     "pigpio>=1.78",
     "rpi_ws281x>=5.0.0",
+    "adafruit-circuitpython-neopixel>=6.3",
+    "adafruit-blinka>=8.20",
+    "gpiozero>=2.0",
+    "pyserial-asyncio>=0.6",
+    "soundfile>=0.12",
 ]
 dev = [
     "pytest>=8",

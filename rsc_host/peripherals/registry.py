@@ -134,9 +134,29 @@ def _build_backends(
             FakeAudio(),
         )
     if backend == "pi":
-        # hal/pi.py lands in Layer 5. Fail loudly rather than silently degrading.
-        raise NotImplementedError(
-            "pi HAL backend not yet implemented — set RSC_HOST_BACKEND=fake for now"
+        # Imported lazily so laptop dev (backend=fake) doesn't need pigpio /
+        # rpi_ws281x / neopixel / gpiozero installed.
+        from rsc_host.hal.pi import (
+            PiAudioBackend,
+            PiGpioInputBackend,
+            PiGpioPwmBackend,
+            PiRingBackend,
+            PiSerialBackend,
+            PiServoBackend,
+        )
+        return (
+            PiServoBackend(
+                pins={
+                    "left":  pinout.flipper_left_pin,
+                    "right": pinout.flipper_right_pin,
+                    "m3":    pinout.flipper_m3_pin,
+                }
+            ),
+            PiRingBackend(pixel_count=pinout.ring_pixel_count),
+            PiGpioInputBackend(pins=[pinout.button_pin]),
+            PiGpioPwmBackend(pins=[pinout.button_led_pin]),
+            PiSerialBackend(),
+            PiAudioBackend(),
         )
     raise ValueError(f"unknown backend: {backend!r}")
 

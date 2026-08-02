@@ -1,0 +1,33 @@
+[Unit]
+Description=Robot Study Companion host service
+Documentation=https://github.com/RobotStudyCompanion/host
+After=network-online.target pigpiod.service
+Wants=network-online.target
+Requires=pigpiod.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/host
+Environment=RSC_HOST_TOKEN=CHANGE_ME
+Environment=RSC_HOST_BACKEND=pi
+Environment=RSC_HOST_BIND=0.0.0.0
+Environment=RSC_HOST_PORT=8765
+Environment=RSC_HOST_LOG_LEVEL=INFO
+Environment=GPIOZERO_PIN_FACTORY=pigpio
+ExecStart=/home/%i/host/.venv/bin/python -m rsc_host
+
+# Safe restart: crash / hardware hiccup / pigpiod restart → we come back too.
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Group membership required for GPIO / SPI / audio / serial access.
+SupplementaryGroups=gpio spi audio dialout i2c
+
+# Reasonable resource caps for a small always-on service.
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
