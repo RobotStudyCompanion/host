@@ -684,6 +684,7 @@ def _require(binary):
     return True
 
 
+
 def run_status():
     """Report the full audio stack state in one screen."""
     if not _require("amixer"):
@@ -1259,19 +1260,22 @@ def run_servo_null():
                 continue
             quietest, best_us = min(scores)
             loudest = max(s for s, _ in scores)
-            if best_us in (widths[0], widths[-1]):
-                print(f"  ** minimum at the edge of the sweep - the true null")
-                print(f"     probably lies beyond {best_us}us. Widen the range.")
-            print(f"\n  quietest at {best_us}us  ({quietest:.1f} dBFS)")
+            # Several widths often sit at the mic's own floor. Take the centre
+            # of the quiet plateau rather than an arbitrary tie among minima.
+            plateau = [us for h, us in scores if h <= quietest + 2.0]
+            centre  = (min(plateau) + max(plateau)) // 2
+            print(f"\n  plateau within 2dB of the floor: "
+                  f"{min(plateau)}-{max(plateau)}us ({len(plateau)} widths)")
+            print(f"  centre {centre}us   (single minimum was {best_us}us)")
             print(f"  range across sweep: {loudest - quietest:.1f} dB")
-            if loudest - quietest < 6:
+            if max(plateau) - min(plateau) > 60:
+                print("  ** plateau too wide to localise - likely ambient noise")
+                print("     masking the servo. Re-run somewhere quieter.")
+            elif loudest - quietest < 6:
                 print("  Too flat to call - the servo never hunted audibly.")
-                print("  Either it is already well trimmed, or it is unpowered.")
             else:
-                trim = best_us - SERVO_STOP
-                print(f"  trim vs SERVO_STOP({SERVO_STOP}): {trim:+d}us")
-                print(f"  suggested: SERVO_{'L' if idx == 0 else 'R'}_NULL = {best_us}")
-            print()
+                print(f"  suggested: SERVO_{'L' if idx == 0 else 'R'}_NULL = {centre}")
+                print(f"  trim vs SERVO_STOP({SERVO_STOP}): {centre - SERVO_STOP:+d}us")
 
     except Exception as e:
         print(f"servo null failed - {e}")
@@ -1925,18 +1929,6 @@ def run_lag_profile():
                 print("  -> Single peak within the physical limit. Possibly a real")
                 print("     delay - confirm the sign flips between the two servos.")
 
-            if abs(best[1]) > 9:
-                print("  ** best lag exceeds the 9-sample physical limit - this")
-                print("     is not an acoustic delay.")
-            if len(top) >= 3 and top[0][0] - top[2][0] < 0.08:
-                print("  ** the top peaks are nearly equal - a comb, not a single")
-                print("     peak. The correlation is locking onto a periodic tone,")
-                print(f"     apparent spacing ~{spacing[0] if spacing else 0} samples.")
-                print("     Repeatable, but carries no direction information.")
-            elif abs(best[1]) <= 9 and top[0][0] - top[1][0] > 0.05:
-                print("  -> Single dominant peak within the physical limit.")
-                print("     This looks like a real acoustic delay.")
-
     except Exception as e:
         print(f"lag profile failed - {e}")
     finally:
@@ -1955,6 +1947,496 @@ def run_lag_profile():
 
 AUDIO_RUNNERS["lag_profile"] = run_lag_profile
 
+# =========================================================================
+# CYD / UART diagnostics
+#
+# Paste this block into rsc_test.py, anywhere after the AUDIO_RUNNERS
+# bindings and before the "--- Registry ---" section.
+#
+# The CYD is an ESP32-2432S028R front panel running the RSC firmware. Its
+# command surface is a dispatch table over UART at 115200 8N1, newline
+# terminated:
+#     setter   key:value      mood:HAPPY
+#     getter   key?           mood?
+#     action   key            blink
+#
+# On this Pi the CYD sits on the GPIO UART (pins 14/15), which is
+# /dev/serial0 -> ttyS0, the mini-UART. `enable_uart=1` in config.txt pins
+# the VPU core clock so the baud rate holds. Without dtoverlay=disable-bt
+# the full PL011 stays on Bluetooth; if you ever see corruption under CPU
+# load, that overlay is the fix.
+# =========================================================================
+
+CYD_PORT = "/dev/serial0"
+CYD_BAUD = 115200
+
+# Never send these. reset wipes NVS; reboot drops the link mid-test;
+# host_poweroff would take the Pi down underneath us.
+CYD_FORBIDDEN = {"reset", "reboot", "host_poweroff", "host_reboot"}
+
+# Unsolicited traffic from the panel. Filter it out of command replies so a
+# stray touch during a test does not corrupt a round-trip.
+CYD_UNSOLICITED = ("host_vol", "host_mute", "host_mic",
+                   "host_reboot", "host_poweroff")
+
+
+def _cyd_open(timeout=0.4):
+    """Open the CYD serial port. Returns a Serial object or None."""
+    try:
+        import serial
+    except ImportError:
+        print("pyserial not installed - pip install pyserial")
+        return None
+    if not os.path.exists(CYD_PORT):
+        print(f"{CYD_PORT} does not exist.")
+        print("  Expected /dev/serial0 -> ttyS0 on the GPIO UART.")
+        print("  Check: ls -l /dev/serial0 /dev/ttyS0")
+        return None
+    try:
+        ser = serial.Serial(CYD_PORT, CYD_BAUD, timeout=timeout)
+    except Exception as e:
+        print(f"cannot open {CYD_PORT} - {e}")
+        print("  Is your user in the 'dialout' group? check: id -nG")
+        return None
+    time.sleep(0.2)               # let the port settle
+    ser.reset_input_buffer()
+    return ser
+
+
+def _cyd_send(ser, cmd, settle=0.35, limit=80):
+    """Send one command and collect the reply lines.
+
+    Reads until the panel goes quiet for `settle` seconds rather than
+    guessing a line count, because replies vary from nothing (actions) to
+    dozens of lines (help, status). Unsolicited host_* messages are
+    filtered out - a stray touch during a test must not corrupt a result.
+    """
+    if cmd.split(":")[0].strip() in CYD_FORBIDDEN:
+        print(f"  refusing to send '{cmd}' - destructive")
+        return []
+    ser.reset_input_buffer()
+    ser.write((cmd + "\n").encode())
+    ser.flush()
+
+    lines, last = [], time.time()
+    while time.time() - last < settle and len(lines) < limit:
+        raw = ser.readline()
+        if not raw:
+            continue
+        last = time.time()
+        try:
+            line = raw.decode("utf-8", "replace").strip()
+        except Exception:
+            continue
+        if not line:
+            continue
+        if any(line.startswith(p) for p in CYD_UNSOLICITED):
+            continue
+        # Some firmwares echo the command back; drop an exact echo.
+        if line == cmd:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _cyd_get(ser, key):
+    """Read one value via the getter form. Returns the last reply line."""
+    lines = _cyd_send(ser, f"{key}?")
+    if not lines:
+        return None
+    # Getters usually reply "key: value" or bare value. Take the tail.
+    line = lines[-1]
+    _, sep, tail = line.partition(":")
+    return tail.strip() if sep else line.strip()
+
+
+# --- CYD runners ----------------------------------------------------------
+
+# =========================================================================
+# CYD / UART diagnostics
+#
+# Paste this block into rsc_test.py, anywhere after the AUDIO_RUNNERS
+# bindings and before the "--- Registry ---" section.
+#
+# The CYD is an ESP32-2432S028R front panel running the RSC firmware. Its
+# command surface is a dispatch table over UART at 115200 8N1, newline
+# terminated:
+#     setter   key:value      mood:HAPPY
+#     getter   key?           mood?
+#     action   key            blink
+#
+# On this Pi the CYD sits on the GPIO UART (pins 14/15), which is
+# /dev/serial0 -> ttyS0, the mini-UART. `enable_uart=1` in config.txt pins
+# the VPU core clock so the baud rate holds. Without dtoverlay=disable-bt
+# the full PL011 stays on Bluetooth; if you ever see corruption under CPU
+# load, that overlay is the fix.
+# =========================================================================
+
+CYD_PORT = "/dev/serial0"
+CYD_BAUD = 115200
+
+# Never send these. reset wipes NVS; reboot drops the link mid-test;
+# host_poweroff would take the Pi down underneath us.
+CYD_FORBIDDEN = {"reset", "reboot", "host_poweroff", "host_reboot"}
+
+# Unsolicited traffic from the panel. Filter it out of command replies so a
+# stray touch during a test does not corrupt a round-trip.
+CYD_UNSOLICITED = ("host_vol", "host_mute", "host_mic",
+                   "host_reboot", "host_poweroff")
+
+
+def _cyd_open(timeout=0.4):
+    """Open the CYD serial port. Returns a Serial object or None."""
+    try:
+        import serial
+    except ImportError:
+        print("pyserial not installed - pip install pyserial")
+        return None
+    if not os.path.exists(CYD_PORT):
+        print(f"{CYD_PORT} does not exist.")
+        print("  Expected /dev/serial0 -> ttyS0 on the GPIO UART.")
+        print("  Check: ls -l /dev/serial0 /dev/ttyS0")
+        return None
+    try:
+        ser = serial.Serial(CYD_PORT, CYD_BAUD, timeout=timeout)
+    except Exception as e:
+        print(f"cannot open {CYD_PORT} - {e}")
+        print("  Is your user in the 'dialout' group? check: id -nG")
+        return None
+    time.sleep(0.2)               # let the port settle
+    ser.reset_input_buffer()
+    return ser
+
+
+def _cyd_send(ser, cmd, settle=0.35, limit=80):
+    """Send one command and collect the reply lines.
+
+    Reads until the panel goes quiet for `settle` seconds rather than
+    guessing a line count, because replies vary from nothing (actions) to
+    dozens of lines (help, status). Unsolicited host_* messages are
+    filtered out - a stray touch during a test must not corrupt a result.
+    """
+    if cmd.split(":")[0].strip() in CYD_FORBIDDEN:
+        print(f"  refusing to send '{cmd}' - destructive")
+        return []
+    ser.reset_input_buffer()
+    ser.write((cmd + "\n").encode())
+    ser.flush()
+
+    lines, last = [], time.time()
+    while time.time() - last < settle and len(lines) < limit:
+        raw = ser.readline()
+        if not raw:
+            continue
+        last = time.time()
+        try:
+            line = raw.decode("utf-8", "replace").strip()
+        except Exception:
+            continue
+        if not line:
+            continue
+        if any(line.startswith(p) for p in CYD_UNSOLICITED):
+            continue
+        # Some firmwares echo the command back; drop an exact echo.
+        if line == cmd:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _cyd_get(ser, key):
+    """Read one value via the getter form. Returns the last reply line."""
+    lines = _cyd_send(ser, f"{key}?")
+    if not lines:
+        return None
+    # Getters usually reply "key: value" or bare value. Take the tail.
+    line = lines[-1]
+    _, sep, tail = line.partition(":")
+    val = (tail if sep else line).strip()
+    # Getters decorate values: "93%", "20 s". Strip the decoration so the
+    # value can be sent straight back as a setter argument.
+    return val.rstrip("%").split()[0] if val else val
+
+
+# --- CYD runners ----------------------------------------------------------
+
+def run_cyd():
+    """Probe the UART link and confirm the panel answers.
+
+    First test to run. If this fails nothing else in the CYD suite means
+    anything, so it reports the likely cause rather than just failing.
+    """
+    ser = _cyd_open()
+    if ser is None:
+        return
+    try:
+        print(f"\n=== CYD link on {CYD_PORT} @ {CYD_BAUD} ===\n")
+
+        probes = [
+            ("version",  "firmware version"),
+            ("uptime",   "uptime"),
+            ("mem",      "free heap"),
+            ("ldr",      "light sensor"),
+            ("menu",     "menu state"),
+        ]
+        ok = 0
+        for cmd, label in probes:
+            lines = _cyd_send(ser, cmd)
+            if lines:
+                ok += 1
+                print(f"  {cmd:<10} {label:<18} {lines[0]}")
+                for extra in lines[1:3]:
+                    print(f"  {'':<10} {'':<18} {extra}")
+            else:
+                print(f"  {cmd:<10} {label:<18} NO REPLY")
+
+        print(f"\n  {ok}/{len(probes)} probes answered")
+        if ok == 0:
+            print("\n  Nothing came back at all. Check in this order:")
+            print("    1. Is the CYD powered and flashed?")
+            print("    2. TX/RX crossed? Pi TX (GPIO14) -> CYD RX, and back.")
+            print("    3. Common ground between Pi and CYD?")
+            print("    4. Anything else holding the port:  sudo lsof /dev/ttyS0")
+            print("    5. Console on the port:  grep console /boot/firmware/cmdline.txt")
+        elif ok < len(probes):
+            print("\n  Partial. Either the firmware predates some commands, or")
+            print("  replies are arriving too slowly - try raising `settle`.")
+        else:
+            print("\n  Link healthy.")
+    finally:
+        ser.close()
+
+
+def run_cyd_dispatch():
+    """Exercise the dispatch table: read, modify, verify, restore.
+
+    Tests that setters actually take effect and getters report the change,
+    rather than assuming the firmware behaves as documented. Every value is
+    restored afterwards, so this is safe to run against a configured panel.
+    """
+    ser = _cyd_open()
+    if ser is None:
+        return
+    try:
+        print("\n=== CYD dispatch table ===\n")
+
+        help_lines = _cyd_send(ser, "help", settle=1.2, limit=200)
+        print(f"  help returned {len(help_lines)} lines")
+        if help_lines:
+            for line in help_lines[:4]:
+                print(f"    {line}")
+            if len(help_lines) > 4:
+                print(f"    ... {len(help_lines) - 4} more")
+        else:
+            print("    (no help output - firmware may not implement it)")
+
+        # key, candidate probe values, description.
+        #
+        # Two candidates per key, and the probe is chosen at runtime to
+        # differ from the value already set. A probe equal to the current
+        # value tests nothing while appearing to pass - which is exactly
+        # how a broken `theme:light` slipped through the first version of
+        # this test.
+        cases = [
+            ("mood",         ["QUESTIONING", "EXCITED"], "eye mood preset"),
+            ("bright",       ["40", "70"],               "backlight percent"),
+            ("theme",        ["light", "dark"],          "colour preset"),
+            ("menu_timeout", ["20", "30"],               "menu idle seconds"),
+            ("auto_bright",  ["on", "off"],              "LDR auto-brightness"),
+            ("hud",          ["on", "off"],              "FPS overlay"),
+        ]
+
+        print("\n  key            before -> set -> readback      result")
+        print("  " + "-" * 62)
+        passed, restored, vacuous = 0, 0, 0
+        for key, candidates, _desc in cases:
+            before = _cyd_get(ser, key)
+            if before is None:
+                print(f"  {key:<14} no getter reply                 SKIP")
+                continue
+
+            probe = next((c for c in candidates
+                          if c.lower() != str(before).lower()), None)
+            if probe is None:
+                vacuous += 1
+                print(f"  {key:<14} {str(before)[:8]:<8} -- no differing probe   SKIP")
+                continue
+
+            _cyd_send(ser, f"{key}:{probe}")
+            time.sleep(0.15)
+            after = _cyd_get(ser, key)
+
+            took = after is not None and probe.lower() in after.lower()
+            # Restore whatever it was.
+            _cyd_send(ser, f"{key}:{before}")
+            time.sleep(0.15)
+            back = _cyd_get(ser, key)
+            back_ok = back is not None and before.lower() in back.lower()
+
+            passed   += 1 if took else 0
+            restored += 1 if back_ok else 0
+            mark = "ok" if took else "FAIL"
+            if not back_ok:
+                mark += " (not restored)"
+            print(f"  {key:<14} {str(before)[:8]:<8} -> {probe:<11} -> "
+                  f"{str(after)[:11]:<11}  {mark}")
+
+        tested = len(cases) - vacuous
+        print(f"\n  {passed}/{tested} setters took effect")
+        print(f"  {restored}/{tested} values restored")
+        if vacuous:
+            print(f"  {vacuous} skipped - no candidate differed from the "
+                  f"current value")
+        if passed < tested:
+            print("\n  A failure here means one of: the setter is a genuine")
+            print("  no-op; the getter reports a different form than the")
+            print("  setter accepts; or the reply arrived after the settle")
+            print("  window closed. Check the raw exchange with:")
+            print("    python -c \"import serial,time;"
+                  "s=serial.Serial('/dev/serial0',115200,timeout=1);"
+                  "s.write(b'theme:light\\n');time.sleep(.5);"
+                  "print(s.read_all())\"")
+    finally:
+        ser.close()
+
+
+def run_cyd_visual():
+    """Walk the visible outputs and ask you to confirm each.
+
+    The serial layer can report success while the display or LED is dead.
+    This is the only test that catches that, so it needs your eyes.
+    """
+    ser = _cyd_open()
+    if ser is None:
+        return
+    try:
+        print("\n=== CYD visual check ===")
+        print("Watch the panel. Answer y/n after each step.\n")
+
+        results = []
+
+        def step(label, cmds, question, pause_s=1.2):
+            for c in cmds:
+                _cyd_send(ser, c)
+                time.sleep(0.25)
+            time.sleep(pause_s)
+            try:
+                ans = input(f"  {question} [y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            good = ans.startswith("y")
+            results.append((label, good))
+            return good
+
+        # Save state so the panel is left as we found it.
+        orig_mood  = _cyd_get(ser, "mood")
+        orig_theme = _cyd_get(ser, "theme")
+        orig_bright = _cyd_get(ser, "bright")
+
+        step("LED red",    ["led:red"],    "LED red?")
+        step("LED green",  ["led:green"],  "LED green?")
+        step("LED blue",   ["led:blue"],   "LED blue?")
+        step("LED off",    ["led:off"],    "LED off?")
+
+        # Force the opposite theme first, so "light" is a real transition
+        # rather than a no-op against a panel already in light mode.
+        step("theme light", ["theme:dark", "theme:light"],
+             "Light background, dark eyes?")
+        step("theme dark",  ["theme:light", "theme:dark"],
+             "Dark background, light eyes?")
+
+        step("mood happy",  ["mood:HAPPY"],  "Eyes look happy?")
+        step("mood angry",  ["mood:ANGRY"],  "Eyes look angry?")
+        # A single blink lasts a few hundred ms and is easy to miss while
+        # reading the prompt. Fire several, spaced, and ask afterwards.
+        step("blink", ["blink", "blink", "blink"],
+             "Did it blink (three times)?", pause_s=0.4)
+        step("look",        ["look:40,-20"], "Gaze shifted?")
+        step("look centre", ["look:0,0"],    "Gaze back to centre?")
+
+        step("backlight low",  ["bright:15"],  "Backlight dim?")
+        step("backlight high", ["bright:90"],  "Backlight bright?")
+
+        step("splash", ["splash"], "Splash screen shown?")
+
+        # Restore.
+        for key, val in (("mood", orig_mood), ("theme", orig_theme),
+                         ("bright", orig_bright)):
+            if val:
+                _cyd_send(ser, f"{key}:{val}")
+                time.sleep(0.2)
+        _cyd_send(ser, "led:off")
+
+        if not results:
+            print("\n  no answers recorded")
+            return
+        good = sum(1 for _, g in results if g)
+        print(f"\n  {good}/{len(results)} visual checks passed")
+        bad = [n for n, g in results if not g]
+        if bad:
+            print("  failed: " + ", ".join(bad))
+            if all(n.startswith("LED") for n in bad):
+                print("\n  All LED steps failed but display steps passed - the")
+                print("  RGB LED is active-low on GPIO 4/16/17. Suspect wiring")
+                print("  or the LED itself, not the serial link.")
+    finally:
+        ser.close()
+
+
+def run_cyd_monitor():
+    """Watch unsolicited host_* traffic from the panel.
+
+    The firmware emits these when you touch on-screen widgets whose state
+    lives on the Pi. This is the contract the daemon has to consume, so it
+    is worth seeing the real messages before implementing against them.
+    """
+    ser = _cyd_open(timeout=0.2)
+    if ser is None:
+        return
+    try:
+        print(f"\nwatching {CYD_PORT} for host_* messages - ctrl-c to stop")
+        print("Long-press the panel to enter the menu, then drag the volume")
+        print("slider and tap the mute / mic icons.\n")
+        seen = {}
+        while True:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            tag = "host" if line.startswith("host_") else "    "
+            print(f"  [{tag}] {line}")
+            if line.startswith("host_"):
+                key = line.split(":")[0]
+                seen[key] = seen.get(key, 0) + 1
+    except KeyboardInterrupt:
+        print("\n\n  message counts:")
+        for k, v in sorted(seen.items()):
+            print(f"    {k:<16} {v}")
+        if not seen:
+            print("    none seen - did you interact with the on-screen menu?")
+        danger = {k: v for k, v in seen.items()
+                  if k in ("host_reboot", "host_poweroff")}
+        if danger:
+            names = ", ".join(f"{k} x{v}" for k, v in sorted(danger.items()))
+            print(f"\n  ** {names} emitted during this session.")
+            print("     Harmless now because nothing consumes host_* messages.")
+            print("     Once the daemon does, those same taps will reboot or")
+            print("     power down the Pi. The CYD already gates them behind a")
+            print("     confirm dialog, so the daemon should act on them")
+            print("     directly rather than adding a second confirmation.")
+    finally:
+        ser.close()
+
+
+CYD_RUNNERS = {
+    "cyd":          run_cyd,
+    "cyd_dispatch": run_cyd_dispatch,
+    "cyd_visual":   run_cyd_visual,
+    "cyd_monitor":  run_cyd_monitor,
+}
 
 # --- Registry -------------------------------------------------------------
 
@@ -1973,8 +2455,8 @@ BEHAVIOURS = {
     "mixed":       Mixed,
 }
 
-CHOICES = list(BEHAVIOURS.keys()) + list(AUDIO_RUNNERS.keys())
-
+CHOICES = (list(BEHAVIOURS.keys()) + list(AUDIO_RUNNERS.keys())
+           + list(CYD_RUNNERS.keys()))
 RING_BEHAVIOURS   = {"ring", "sweep", "mixed"}
 SERVO_BEHAVIOURS  = {"servo_hold", "servo_cycle", "servo_dir", "servo_sweep",
                      "mixed"}
@@ -2071,7 +2553,11 @@ def main():
     if args.behaviour in AUDIO_RUNNERS:
         AUDIO_RUNNERS[args.behaviour]()
         return
-
+    
+    if args.behaviour in CYD_RUNNERS:
+        CYD_RUNNERS[args.behaviour]()
+        return
+    
     atexit.register(_force_led_low)
 
     button = None
