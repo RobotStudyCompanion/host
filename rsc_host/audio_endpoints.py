@@ -12,9 +12,14 @@ Two handlers, both auth-checked by the server before we're called:
     An ack is delivered on the JSON channel via events
     (``audio.stream.started`` / ``audio.stream.done``).
 
-  * :func:`audio_in_handler` — starts a capture session on connect and
-    streams PCM frames to the client as binary frames until either side
-    closes. Guarantees the session is stopped on disconnect.
+  * :func:`audio_in_handler` — starts a capture session on connect and streams
+    PCM as binary frames until either side closes. Guarantees the session is
+    stopped on disconnect.
+
+    The socket carries binary PCM only. The capture format is not fixed — the
+    device runs at 48 kHz stereo while the DSP chain emits mono at a retunable
+    stream rate — so clients read it from the ``audio.capture.started`` event
+    on the main JSON channel, or by calling ``audio.capture.config``.
 
 Kept separate from :mod:`rsc_host.server` so the transport layer stays
 transport-only. Registered from :mod:`rsc_host.__main__`.
@@ -28,6 +33,7 @@ import struct
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
+from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.peripherals.audio import Audio, CaptureBusyError
 
 log = logging.getLogger(__name__)
@@ -180,7 +186,13 @@ def build_audio_out_handler(audio: Audio):
 
 
 def build_audio_in_handler(audio: Audio):
-    """Return a path handler that streams capture frames to the client."""
+    """Return a path handler that streams capture frames to the client.
+
+    Every frame is binary PCM; nothing else is sent on this socket. The format
+    is not inferable from the stream, so it travels on the main JSON channel
+    instead: the ``audio.capture.started`` event carries it, and
+    ``audio.capture.config`` returns it on demand.
+    """
 
     async def handler(ws: ServerConnection) -> None:
         try:
@@ -188,41 +200,52 @@ def build_audio_in_handler(audio: Audio):
         except CaptureBusyError:
             await ws.close(code=1013, reason="capture busy")
             return
+        except PeripheralUnavailableError as exc:
+            log.warning("/audio/in: capture unavailable: %s", exc)
+            await ws.close(code=1011, reason="capture unavailable")
+            return
         except Exception:
             log.exception("/audio/in: start_capture failed")
             await ws.close(code=1011, reason="capture failed")
             return
 
         try:
-            while True:
-                # Two concurrent waits: a new frame from the mic, or the
-                # client disconnecting. Whichever finishes first wins.
-                frame_task = asyncio.create_task(queue.get(), name="capture-get")
-                recv_task = asyncio.create_task(ws.recv(), name="capture-recv")
-                try:
-                    done, pending = await asyncio.wait(
+            # One long-lived receive task, not one per frame. The previous
+            # version created and cancelled a task on every 20 ms period, which
+            # is ~100 task allocations per second per listener for no reason.
+            recv_task = asyncio.create_task(ws.recv(), name="capture-recv")
+            try:
+                while True:
+                    frame_task = asyncio.create_task(queue.get(), name="capture-get")
+                    done, _ = await asyncio.wait(
                         {frame_task, recv_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for task in pending:
-                        task.cancel()
-                    for task in pending:
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
 
                     if recv_task in done:
                         # Client sent something or closed; either way we're done.
+                        frame_task.cancel()
+                        try:
+                            await frame_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                         return
 
                     frame = frame_task.result()
                     if frame == b"":
-                        # Sentinel from stop_capture — end of stream.
+                        # Sentinel from stop_capture, or the capture process
+                        # ending — end of stream either way.
                         return
-                    await ws.send(frame)
-                except ConnectionClosed:
-                    return
+                    try:
+                        await ws.send(frame)
+                    except ConnectionClosed:
+                        return
+            finally:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         finally:
             # Whether the client left, the server ended the session, or an
             # exception fired — always tear the capture session down.

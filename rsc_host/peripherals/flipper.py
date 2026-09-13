@@ -31,6 +31,19 @@ log = logging.getLogger(__name__)
 _RAMP_HZ = 100.0
 _RAMP_PERIOD = 1.0 / _RAMP_HZ
 
+# Publish one event per this many ramp steps (plus always the final one). At
+# 100 Hz an unthrottled 1 s ramp fans 100 events out to every subscriber, on
+# every flipper, which swamps the bus and the WebSocket for no visual gain.
+# Every 10th step is 10 Hz — smooth enough to animate a trajectory client-side.
+_RAMP_EVENTS_PER_RAMP = 5
+"""Roughly how many state events a ramp publishes, regardless of its length.
+
+A fixed "every Nth step" throttle silences short ramps entirely: at 100 Hz a
+50 ms ramp is five steps, so every-10th publishes only the final one and the
+client sees a teleport. Scaling the interval to the ramp keeps short ramps
+legible while still capping a two-second ramp at a handful of events.
+"""
+
 
 class Flipper:
     """One flipper servo (left / right / m3).
@@ -121,10 +134,15 @@ class Flipper:
         """Interpolate ``start`` → ``target`` over ``ramp_ms`` at _RAMP_HZ."""
         try:
             steps = max(1, int(ramp_ms / 1000.0 * _RAMP_HZ))
+            every = max(1, steps // _RAMP_EVENTS_PER_RAMP)
             for i in range(1, steps + 1):
                 fraction = i / steps
                 intermediate = start + (target - start) * fraction
-                await self._apply(intermediate)
+                # Every step reaches the hardware; only every Nth is published.
+                await self._apply(
+                    intermediate,
+                    publish=(i == steps or i % every == 0),
+                )
                 if i < steps:
                     await asyncio.sleep(_RAMP_PERIOD)
         except asyncio.CancelledError:
@@ -132,11 +150,13 @@ class Flipper:
             # own target. Don't emit a final event here; the new call will.
             raise
 
-    async def _apply(self, speed: float) -> None:
-        """Write speed to the HAL (if enabled) and publish an event."""
+    async def _apply(self, speed: float, *, publish: bool = True) -> None:
+        """Write speed to the HAL (if enabled) and optionally publish an event."""
         self._current_speed = speed
         if self._enabled:
             await self._backend.set_speed(self.id, speed)
+        if not publish:
+            return
         await self._bus.publish(
             Event(
                 topic=f"flipper.{self.id}.state",

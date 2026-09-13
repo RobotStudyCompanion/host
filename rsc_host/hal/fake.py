@@ -50,8 +50,12 @@ class FakeServo(ServoBackend):
     seen, which means servos registered but never moved will still be set to 0.
     """
 
+    _DEFAULT_CAL = {"null_us": 1500, "span_us": 100, "invert": False,
+                    "min_us": 900, "max_us": 2100}
+
     def __init__(self) -> None:
         self._speeds: dict[str, float] = {}
+        self._cal: dict[str, dict] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -73,6 +77,25 @@ class FakeServo(ServoBackend):
         for servo_id in self._speeds:
             self._speeds[servo_id] = 0.0
         log.info("FakeServo stop_all (%d servos)", len(self._speeds))
+
+    def calibration(self, servo_id: str | None = None) -> dict:
+        if servo_id is not None:
+            return {servo_id: dict(self._cal.get(servo_id, self._DEFAULT_CAL))}
+        known = set(self._cal) | set(self._speeds) | {"left", "right", "m3"}
+        return {sid: dict(self._cal.get(sid, self._DEFAULT_CAL)) for sid in sorted(known)}
+
+    def set_calibration(self, servo_id: str, **changes) -> dict:
+        unknown = set(changes) - set(self._DEFAULT_CAL)
+        if unknown:
+            raise ValueError(f"unknown calibration fields: {sorted(unknown)}")
+        current = dict(self._cal.get(servo_id, self._DEFAULT_CAL))
+        current.update(changes)
+        if not current["min_us"] < current["null_us"] < current["max_us"]:
+            raise ValueError(f"{servo_id}: null_us outside the pulse window")
+        if current["span_us"] <= 0:
+            raise ValueError(f"{servo_id}: span_us must be > 0")
+        self._cal[servo_id] = current
+        return dict(current)
 
     # ---- Test hooks ----
 
@@ -302,6 +325,18 @@ class FakeAudio(AudioBackend):
         self._streamed: list[dict] = []
         self._capture_callback: AudioCallback | None = None
         self._running = False
+        # Capture chain parameters, mirroring the Pi backend so the tuning
+        # verbs can be exercised on a laptop. The chain itself is built lazily
+        # (it needs numpy) and only when a frame is actually pushed through.
+        self._capture_config: object | None = None
+        self._chain: object | None = None
+        self._mixer: dict[str, str] = {
+            "ALC Function": "Off",
+            "ADC High Pass Filter": "on",
+            "Left Input Boost Mixer LINPUT1": "3",
+            "Capture": "35",
+            "Playback": "255",
+        }
         self._devices: dict = {
             "input":  [{"index": 0, "name": "Fake Mic",     "channels": 1, "samplerate": 16000}],
             "output": [{"index": 0, "name": "Fake Speaker", "channels": 2, "samplerate": 48000}],
@@ -353,9 +388,64 @@ class FakeAudio(AudioBackend):
 
     async def start_capture(self, callback: AudioCallback) -> None:
         self._capture_callback = callback
+        self._chain = None  # rebuilt on the first frame
 
     async def stop_capture(self) -> None:
         self._capture_callback = None
+        self._chain = None
+
+    # ---- Optional capabilities ----
+
+    def _config(self):
+        """Lazily construct the default capture config (needs numpy)."""
+        from rsc_host.hal.dsp import CaptureConfig
+
+        if self._capture_config is None:
+            self._capture_config = CaptureConfig()
+        return self._capture_config
+
+    def capture_config(self) -> dict:
+        cfg = self._config()
+        out = cfg.as_dict()
+        out["capturing"] = self._capture_callback is not None
+        out["valid_stream_rates"] = list(
+            type(cfg).valid_stream_rates(cfg.device_rate)
+        )
+        return out
+
+    def retune_capture(self, **changes) -> dict:
+        from dataclasses import replace
+
+        self._capture_config = replace(self._config(), **changes)  # validates
+        self._chain = None
+        return self.capture_config()
+
+    def capture_stats(self) -> dict:
+        if self._chain is None:
+            return {"capturing": self._capture_callback is not None,
+                    "config": self._config().as_dict()}
+        stats = self._chain.stats()  # type: ignore[attr-defined]
+        stats["capturing"] = True
+        return stats
+
+    def reset_capture_stats(self) -> None:
+        if self._chain is not None:
+            self._chain.reset_stats()  # type: ignore[attr-defined]
+
+    async def mixer_get(self, names=None) -> dict:
+        wanted = tuple(names) if names is not None else tuple(self._mixer)
+        return {"card": "fake",
+                "controls": {n: self._mixer.get(n) for n in wanted}}
+
+    async def mixer_set(self, name: str, value: str) -> dict:
+        self._mixer[name] = value
+        return {"control": name, "value": value}
+
+    async def mixer_apply_preset(self) -> dict:
+        return {name: "ok" for name in self._mixer}
+
+    async def mixer_store(self, path: str = "/var/lib/alsa/asound.state") -> dict:
+        return {"stored": True, "path": path}
 
     # ---- Test hooks ----
 
@@ -377,8 +467,21 @@ class FakeAudio(AudioBackend):
     def is_capturing(self) -> bool:
         return self._capture_callback is not None
 
-    def emit_capture(self, frame: bytes) -> None:
+    def emit_capture(self, frame: bytes, *, process: bool = False) -> None:
         """Synthesise a captured audio frame to the current callback.
-        No-op if capture isn't running."""
-        if self._capture_callback is not None:
+
+        No-op if capture isn't running. With ``process=True`` the frame is run
+        through the real :class:`~rsc_host.hal.dsp.CaptureChain` first, so a
+        test can drive the same DSP the hardware backend uses — pass raw
+        interleaved device-rate bytes in that case.
+        """
+        if self._capture_callback is None:
+            return
+        if process:
+            from rsc_host.hal.dsp import CaptureChain
+
+            if self._chain is None:
+                self._chain = CaptureChain(self._config())
+            frame = self._chain.process(frame)  # type: ignore[attr-defined]
+        if frame:
             self._capture_callback(frame)

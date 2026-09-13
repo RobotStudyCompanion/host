@@ -24,6 +24,7 @@ import json
 import logging
 import ssl
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlsplit
 
 import websockets
 from pydantic import ValidationError
@@ -166,7 +167,11 @@ class Server:
     async def _handle_connection(self, ws: ServerConnection) -> None:
         """Route to path-specific handler, or fall through to JSON control."""
         peer = ws.remote_address
-        path = ws.request.path if ws.request else "/"
+        raw_path = ws.request.path if ws.request else "/"
+        # Route on the path alone. A client appending a query string (a
+        # cache-buster, a client id) would otherwise miss its handler entirely
+        # and silently fall through to the JSON control loop.
+        path = urlsplit(raw_path).path or "/"
         log.info("client connected: %s path=%s", peer, path)
 
         try:

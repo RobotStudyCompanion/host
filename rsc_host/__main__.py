@@ -19,7 +19,7 @@ from rsc_host.config import Config, load_from_env
 from rsc_host.discovery import DiscoveryInfo, ServiceAdvertiser, resolve_robot_name
 from rsc_host.dispatch import default_dispatcher, verb
 from rsc_host.events import default_bus
-from rsc_host.peripherals.registry import AudioConfig, setup as setup_peripherals
+from rsc_host.peripherals.registry import setup as setup_peripherals
 from rsc_host.server import Server, build_ssl_context
 
 log = logging.getLogger(__name__)
@@ -92,24 +92,36 @@ async def _run(config: Config) -> None:
         ssl_ctx = build_ssl_context(config.tls_cert, config.tls_key)
 
     log.info(
-        "rsc-host %s starting (backend=%s, tls=%s)",
+        "rsc-host %s starting (backend=%s, tls=%s, bind=%s:%d)",
         __version__,
         config.backend,
         config.tls_enabled,
+        config.bind,
+        config.port,
+    )
+    log.info(
+        "audio: %s @ %d Hz x%d -> %d Hz mono (%s, hpf=%.0f Hz, aec=%s); "
+        "ring mode=%s; servo idle=%d ms",
+        config.audio.input_device,
+        config.audio.device_rate,
+        config.audio.device_channels,
+        config.audio.stream_rate,
+        config.audio.channel_mode,
+        config.audio.hpf_hz,
+        config.audio.aec,
+        config.ring.mode,
+        config.servo.idle_ms,
     )
 
     # Boot peripherals BEFORE the server, so verbs are registered and the
     # arcade button's edge callback is live before any client can connect.
-    audio_config = AudioConfig(
-        input_device=config.audio_input,
-        output_device=config.audio_output,
-        samplerate=config.audio_samplerate,
-        channels=config.audio_channels,
-    )
     peripherals = await setup_peripherals(
         default_dispatcher, default_bus,
         backend=config.backend,
-        audio_config=audio_config,
+        audio_settings=config.audio,
+        servo_settings=config.servo,
+        ring_settings=config.ring,
+        serial_settings=config.serial,
     )
 
     server = Server(

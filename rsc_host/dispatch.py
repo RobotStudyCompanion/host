@@ -33,9 +33,46 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from rsc_host.errors import (
+    CalibrationError,
+    PeripheralBusyError,
+    PeripheralUnavailableError,
+)
 from rsc_host.protocol import Ack, Cmd, ErrorCode
 
 log = logging.getLogger(__name__)
+
+#: Handler exceptions that carry a meaningful, client-safe wire code.
+#: Order matters — the first match wins, so subclasses come before their bases
+#: (CalibrationError derives from ValueError).
+#:
+#: Anything not listed here becomes INTERNAL_ERROR with a generic message and a
+#: server-side traceback, because an unclassified exception is a bug and its
+#: text has not been vetted for leaking internals.
+_ERROR_CODES: tuple[tuple[type[BaseException], ErrorCode], ...] = (
+    (PeripheralBusyError, ErrorCode.PERIPHERAL_BUSY),
+    (PeripheralUnavailableError, ErrorCode.PERIPHERAL_UNAVAILABLE),
+    (NotImplementedError, ErrorCode.PERIPHERAL_UNAVAILABLE),
+    (CalibrationError, ErrorCode.INVALID_ARGS),
+    (KeyError, ErrorCode.INVALID_ARGS),
+    (IndexError, ErrorCode.INVALID_ARGS),
+    (ValueError, ErrorCode.INVALID_ARGS),
+)
+
+
+def classify(exc: BaseException) -> tuple[ErrorCode, str] | None:
+    """Map a handler exception onto a wire code and message.
+
+    Returns None for exceptions with no mapping, which the caller should
+    surface as INTERNAL_ERROR.
+    """
+    for exc_type, code in _ERROR_CODES:
+        if isinstance(exc, exc_type):
+            # KeyError stringifies with quotes around the key; unwrap it so the
+            # client sees "unknown servo_id: 'x'" and not "\"unknown ...\"".
+            message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+            return code, str(message)
+    return None
 
 # A handler takes a validated args model instance and returns a result dict (or None).
 Handler = Callable[[Any], Awaitable[dict[str, Any] | None]]
@@ -117,10 +154,19 @@ class Dispatcher:
 
         try:
             result = await reg.handler(validated)
-        except Exception:
-            log.exception(
-                "handler raised for verb=%s id=%s", cmd.verb, cmd.id
-            )
+        except Exception as exc:
+            classified = classify(exc)
+            if classified is not None:
+                code, message = classified
+                # Expected failure modes: a peripheral that is busy or absent,
+                # or arguments the schema could not catch. Log at info — these
+                # are not faults, and at debug volume they drown the real ones.
+                log.info(
+                    "verb=%s id=%s failed: %s: %s",
+                    cmd.verb, cmd.id, type(exc).__name__, message,
+                )
+                return Ack.failure(cmd.id, code, message)
+            log.exception("handler raised for verb=%s id=%s", cmd.verb, cmd.id)
             return Ack.failure(
                 cmd.id,
                 ErrorCode.INTERNAL_ERROR,

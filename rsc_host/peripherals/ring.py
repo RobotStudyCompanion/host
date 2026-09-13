@@ -33,6 +33,7 @@ import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.events import EventBus
 from rsc_host.hal.base import RingBackend
 from rsc_host.hal.types import Colour
@@ -182,10 +183,21 @@ class Ring:
         return self._current_mode
 
     async def set_mode(self, mode: str, params: dict[str, Any] | None = None) -> None:
-        """Switch to ``mode``. Unknown modes raise ``KeyError``."""
+        """Switch to ``mode``.
+
+        Raises ``KeyError`` for an unknown mode, and
+        :class:`~rsc_host.errors.PeripheralUnavailableError` when the ring has
+        no privileged path to the hardware — better an explicit failure than a
+        success Ack for pixels nobody will ever see.
+        """
         if mode not in _modes:
             raise KeyError(
                 f"unknown ring mode: {mode!r}; known: {registered_modes()}"
+            )
+        if not self._backend.available:
+            status = self._backend.status()
+            raise PeripheralUnavailableError(
+                f"ring is not available: {status.get('reason') or 'unknown reason'}"
             )
         params = params or {}
         async with self._lock:
@@ -194,7 +206,7 @@ class Ring:
             self._current_params = dict(params)
             fn = _modes[mode]
             self._task = asyncio.create_task(
-                fn(self._backend, dict(params)),
+                self._run_mode(mode, fn, dict(params)),
                 name=f"ring-mode-{mode}",
             )
         await self._bus.publish(
@@ -205,12 +217,32 @@ class Ring:
             )
         )
 
+    async def _run_mode(self, name: str, fn: ModeFn, params: dict[str, Any]) -> None:
+        """Run a mode coroutine, catching a hardware disappearance.
+
+        If the helper dies mid-animation the mode raises on its next
+        ``show()``. Without this wrapper that becomes an unretrieved task
+        exception — logged by asyncio at an unhelpful moment, with no clue
+        which mode it came from.
+        """
+        try:
+            await fn(self._backend, params)
+        except asyncio.CancelledError:
+            raise
+        except PeripheralUnavailableError as exc:
+            log.warning("ring mode %r stopped: %s", name, exc)
+        except Exception:
+            log.exception("ring mode %r failed", name)
+
     async def stop(self) -> None:
         """Cancel the mode task and clear the ring."""
         async with self._lock:
             await self._cancel_task()
-            await self._backend.fill(Colour.black())
-            await self._backend.show()
+            try:
+                await self._backend.fill(Colour.black())
+                await self._backend.show()
+            except PeripheralUnavailableError:
+                pass  # nothing lit, nothing to clear
             self._current_mode = None
 
     async def _cancel_task(self) -> None:

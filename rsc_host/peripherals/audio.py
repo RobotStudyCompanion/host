@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from rsc_host.errors import PeripheralBusyError
 from rsc_host.events import EventBus
 from rsc_host.hal.base import AudioBackend
 from rsc_host.protocol import Event
@@ -28,11 +29,11 @@ from rsc_host.protocol import Event
 log = logging.getLogger(__name__)
 
 
-class PlaybackBusyError(RuntimeError):
+class PlaybackBusyError(PeripheralBusyError):
     """Raised when a play request arrives while another is in progress."""
 
 
-class CaptureBusyError(RuntimeError):
+class CaptureBusyError(PeripheralBusyError):
     """Raised when a capture session is requested while one is already active."""
 
 
@@ -93,8 +94,11 @@ class Audio:
                     outcome = "cancelled"
                     raise
                 except Exception as exc:
+                    # Publish the failure, then re-raise: swallowing it here
+                    # made a dead speaker look like a successful Ack.
                     log.exception("playback failed")
                     outcome = f"error: {type(exc).__name__}"
+                    raise
                 finally:
                     await self._bus.publish(
                         Event(
@@ -172,6 +176,7 @@ class Audio:
                 except Exception as exc:
                     log.exception("stream failed")
                     outcome = f"error: {type(exc).__name__}"
+                    raise
                 finally:
                     await self._bus.publish(
                         Event(
@@ -209,6 +214,35 @@ class Audio:
     def is_capturing(self) -> bool:
         return self._capture_queue is not None
 
+    def capture_format(self) -> dict:
+        """What the frames on ``/audio/in`` actually are.
+
+        Clients cannot infer this: the device runs at 48 kHz stereo but the
+        chain emits mono at the stream rate. Published with
+        ``audio.capture.started`` and sent as the first text frame on the
+        binary endpoint, so a client that only opens ``/audio/in`` still knows
+        what it is receiving.
+
+        Falls back to a minimal description on backends that do not expose a
+        capture chain.
+        """
+        try:
+            cfg = self._backend.capture_config()
+        except Exception:
+            return {"samplerate": None, "channels": 1, "sample_width": 2,
+                    "encoding": "s16le"}
+        return {
+            "samplerate": cfg.get("stream_rate"),
+            "channels": 1,
+            "sample_width": 2,
+            "encoding": "s16le",
+            "device_rate": cfg.get("device_rate"),
+            "channel_mode": cfg.get("channel_mode"),
+            "hpf_hz": cfg.get("hpf_hz"),
+            "aec": cfg.get("aec"),
+            "frame_samples": cfg.get("output_frame_samples"),
+        }
+
     async def start_capture(self, queue_maxsize: int = 256) -> asyncio.Queue[bytes]:
         """Begin streaming captured audio into a queue for a subscriber to drain.
 
@@ -240,7 +274,11 @@ class Audio:
 
             await self._backend.start_capture(_on_frame)
             await self._bus.publish(
-                Event(topic="audio.capture.started", source="host", data={})
+                Event(
+                    topic="audio.capture.started",
+                    source="host",
+                    data=self.capture_format(),
+                )
             )
             return queue
 

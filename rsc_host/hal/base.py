@@ -20,8 +20,9 @@ in between; peripherals don't need to know about init order.
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Callable, Iterable
 
+from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.hal.types import Colour, GpioEdge
 
 
@@ -68,6 +69,28 @@ class ServoBackend(Backend):
     async def stop_all(self) -> None:
         """Set every known servo to speed 0. Called on shutdown for safety."""
 
+    # ---- Optional ----
+
+    def calibration(self, servo_id: str | None = None) -> dict:
+        """Per-servo pulse-width calibration, keyed by servo_id.
+
+        Exposed so a calibration run can read the values the daemon is
+        actually using rather than what the source file says.
+        """
+        raise PeripheralUnavailableError(
+            "calibration is not supported by this servo backend"
+        )
+
+    def set_calibration(self, servo_id: str, **changes) -> dict:
+        """Update calibration in memory, from the next command onward.
+
+        Deliberately not persisted: a value found by one calibration run
+        belongs in the unit file only once a second run agrees with it.
+        """
+        raise PeripheralUnavailableError(
+            "calibration is not supported by this servo backend"
+        )
+
 
 # -----------------------------------------------------------------------------
 # Addressable LED ring
@@ -104,6 +127,22 @@ class RingBackend(Backend):
     async def get_frame(self) -> tuple[Colour, ...]:
         """Return the currently *displayed* (last shown) frame. Length =
         :attr:`pixel_count`. Useful for tests and the ``status`` snapshot."""
+
+    # ---- Optional ----
+
+    @property
+    def available(self) -> bool:
+        """Whether the ring can actually be driven.
+
+        The Pi backend can start successfully and still have no privileged
+        path to the strip, in which case it reports False and :meth:`show`
+        raises. Backends that always work leave this True.
+        """
+        return True
+
+    def status(self) -> dict:
+        """Diagnostic snapshot for the ``ring.status`` verb."""
+        return {"available": self.available, "pixels": self.pixel_count}
 
 
 # -----------------------------------------------------------------------------
@@ -238,3 +277,53 @@ class AudioBackend(Backend):
     @abc.abstractmethod
     async def stop_capture(self) -> None:
         """Stop capture. Idempotent. Safe to call when no capture is running."""
+
+    # ---- Optional capabilities ----
+    #
+    # Concrete, not abstract: a backend that cannot do these still satisfies
+    # the interface, and the verbs that expose them return
+    # PERIPHERAL_UNAVAILABLE rather than failing to register. The Pi backend
+    # implements all of them; the fake implements the capture-side ones so
+    # tuning can be exercised without hardware.
+
+    @staticmethod
+    def _unsupported(what: str) -> PeripheralUnavailableError:
+        return PeripheralUnavailableError(
+            f"{what} is not supported by this audio backend"
+        )
+
+    def capture_config(self) -> dict:
+        """Current capture chain parameters, plus what is legal to change."""
+        raise self._unsupported("capture configuration")
+
+    def retune_capture(self, **changes) -> dict:
+        """Change capture parameters live. Returns the new configuration.
+
+        Implementations validate before applying and leave the running chain
+        untouched on a rejected combination.
+        """
+        raise self._unsupported("capture tuning")
+
+    def capture_stats(self) -> dict:
+        """Live level statistics — the daemon's equivalent of ``rsc-test meter``."""
+        raise self._unsupported("capture statistics")
+
+    def reset_capture_stats(self) -> None:
+        """Zero the statistics accumulators."""
+        raise self._unsupported("capture statistics")
+
+    async def mixer_get(self, names: Iterable[str] | None = None) -> dict:
+        """Read hardware mixer controls."""
+        raise self._unsupported("mixer control")
+
+    async def mixer_set(self, name: str, value: str) -> dict:
+        """Write one hardware mixer control."""
+        raise self._unsupported("mixer control")
+
+    async def mixer_apply_preset(self) -> dict:
+        """Apply the known-good mixer state for this hardware."""
+        raise self._unsupported("mixer control")
+
+    async def mixer_store(self, path: str = "/var/lib/alsa/asound.state") -> dict:
+        """Persist the mixer state so it survives a reboot."""
+        raise self._unsupported("mixer persistence")

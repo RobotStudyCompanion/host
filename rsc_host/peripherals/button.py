@@ -48,6 +48,11 @@ class ArcadeButton:
         self._bus = bus
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_edge_ns: dict[Edge, int] = {}
+        # asyncio keeps only a weak reference to a running task. Without a
+        # strong one here, a publish scheduled from the edge callback can be
+        # garbage collected before it runs — a press that vanishes under load
+        # and never under test.
+        self._pending: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """Register the edge callback. Backend must already be started."""
@@ -68,7 +73,7 @@ class ArcadeButton:
         if loop is None:
             log.warning("button edge received before start(); dropping")
             return
-        loop.create_task(
+        task = loop.create_task(
             self._bus.publish(
                 Event(
                     topic=topic,
@@ -77,3 +82,5 @@ class ArcadeButton:
                 )
             )
         )
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
