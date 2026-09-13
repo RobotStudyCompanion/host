@@ -31,6 +31,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from rsc_host.config import AudioSettings, RingSettings, SerialSettings, ServoSettings
+from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
 from rsc_host.hal.base import (
@@ -309,6 +310,14 @@ class _AudioPlayUrlArgs(BaseModel):
     preempt: bool = False
 
 
+class _AudioSelftestArgs(BaseModel):
+    """Record a short clip, write it to disk, optionally play it straight back."""
+
+    seconds: float = Field(default=3.0, ge=0.5, le=30.0)
+    playback: bool = True
+    path: str = Field(default="/tmp/rsc_selftest.wav", max_length=512)
+
+
 class _ServoCalibrationArgs(BaseModel):
     """Read calibration. Omit ``id`` for every servo."""
 
@@ -578,6 +587,91 @@ async def setup(
     @dispatcher.verb("audio.devices", args_model=_EmptyArgs)
     async def _audio_devices(_args: _EmptyArgs) -> dict:
         return await audio_be.list_devices()
+
+    @dispatcher.verb("audio.selftest", args_model=_AudioSelftestArgs)
+    async def _audio_selftest(args: _AudioSelftestArgs) -> dict:
+        """Record, measure, write, play back — the whole audio path in one verb.
+
+        Capture and playback are the only subsystems that cannot be checked by
+        eye, and a deaf microphone produces a file of exactly the right length
+        full of near-silence. Returning levels alongside the path means a dead
+        input reads as a number rather than as a file nobody opens.
+
+        Blocks for roughly ``seconds`` twice over when playback is on — once
+        recording, once playing.
+        """
+        import math
+        import wave
+
+        import numpy as np
+
+        fmt = audio.capture_format()
+        rate = int(fmt["samplerate"])
+        channels = int(fmt["channels"])
+        width = int(fmt["sample_width"])
+
+        queue = await audio.start_capture()
+        chunks: list[bytes] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + args.seconds
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except TimeoutError:
+                    break
+                if frame == b"":
+                    break  # sentinel: capture ended on its own
+                chunks.append(frame)
+        finally:
+            await audio.stop_capture()
+
+        pcm = b"".join(chunks)
+        if not pcm:
+            raise PeripheralUnavailableError(
+                "capture produced no audio; check `arecord -l` and the mixer"
+            )
+
+        def _write_and_measure() -> dict:
+            with wave.open(args.path, "wb") as w:
+                w.setnchannels(channels)
+                w.setsampwidth(width)
+                w.setframerate(rate)
+                w.writeframes(pcm)
+            xs = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+
+            def dbfs(v: float) -> float:
+                return round(20 * math.log10(v / 32768), 1) if v > 0 else -120.0
+
+            return {
+                "peak_dbfs": dbfs(float(np.abs(xs).max())),
+                "rms_dbfs": dbfs(float(np.sqrt((xs**2).mean()))),
+            }
+
+        levels = await asyncio.to_thread(_write_and_measure)
+
+        frames = len(pcm) // (width * channels)
+        result = {
+            "path": args.path,
+            "bytes": len(pcm),
+            "seconds": round(frames / rate, 3),
+            "format": fmt,
+            "played": False,
+            **levels,
+        }
+
+        if args.playback:
+            def _read() -> bytes:
+                with open(args.path, "rb") as fh:
+                    return fh.read()
+
+            wav_bytes = await asyncio.to_thread(_read)
+            await audio.play(wav_bytes, preempt=True)
+            result["played"] = True
+        return result
 
     # ---- Capture chain tuning ----
     #

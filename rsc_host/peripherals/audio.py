@@ -219,9 +219,8 @@ class Audio:
 
         Clients cannot infer this: the device runs at 48 kHz stereo but the
         chain emits mono at the stream rate. Published with
-        ``audio.capture.started`` and sent as the first text frame on the
-        binary endpoint, so a client that only opens ``/audio/in`` still knows
-        what it is receiving.
+        ``audio.capture.started`` and returned by ``audio.capture.config``;
+        the ``/audio/in`` socket itself carries binary PCM only.
 
         Falls back to a minimal description on backends that do not expose a
         capture chain.

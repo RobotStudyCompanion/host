@@ -1,40 +1,69 @@
 [Unit]
-Description=Robot Study Companion host service
-Documentation=https://github.com/RobotStudyCompanion/host
-After=network-online.target pigpiod.service
-Wants=network-online.target
-Requires=pigpiod.service
-StartLimitBurst=5
-StartLimitIntervalSec=60
+Description=RSC host daemon (%i)
+
+# Ordering, carefully:
+#
+#   * rsc-ring.service is pulled in by Wants but deliberately NOT in After.
+#     After= is bidirectional — start after, stop *before* — which produced an
+#     ordering cycle on shutdown as well as boot. The daemon does not need the
+#     helper to be up first: RingHelperClient reconnects once and
+#     PiRingBackend never raises on start, so a helper that binds its socket a
+#     moment later is handled.
+#
+#   * network-online.target is omitted entirely. The daemon binds a listening
+#     socket, which works with or without a route. Only zeroconf cares, and it
+#     retries. On cloud-init images this target orders late enough that pulling
+#     it in from a multi-user.target unit can itself cycle.
+#
+#   * Nothing here may be After=multi-user.target, since this unit is WantedBy
+#     that target.
+After=sound.target
+Wants=rsc-ring.service
 
 [Service]
 Type=simple
 User=%i
-WorkingDirectory=/home/%i/host
-Environment=RSC_HOST_TOKEN=CHANGE_ME
+Group=%i
+WorkingDirectory=/home/rsc/rsc-host
+
+# /home/rsc/rsc-env, NOT /home/rsc/rsc-host/.venv. The latter has an old
+# rsc_host pip-installed into site-packages, which would shadow the source
+# tree and silently run stale code.
+ExecStart=/home/rsc/rsc-env/bin/python -m rsc_host
+
+# gpio for the chardev lines and the ring socket; audio for the WM8960.
+SupplementaryGroups=gpio audio
+
 Environment=RSC_HOST_BACKEND=pi
 Environment=RSC_HOST_BIND=0.0.0.0
 Environment=RSC_HOST_PORT=8765
+Environment=RSC_HOST_RING_MODE=helper
+# 48 kHz on the wire: the device runs at 48 k, so nothing resamples on the
+# way out. 16 k is available live via audio.capture.tune when a speech model
+# needs it, but the decimated path still has an audible fault under
+# investigation — see docs. Bandwidth at 48 k mono is 96 kB/s, trivial on LAN.
+Environment=RSC_HOST_AUDIO_STREAM_RATE=48000
 Environment=RSC_HOST_LOG_LEVEL=INFO
-Environment=GPIOZERO_PIN_FACTORY=pigpio
-# Audio — leave unset to use ALSA defaults, or override to pin a device.
-# Values can be an integer index (e.g. 1) or a name substring (e.g. "USB").
-# Use `rsc-host-audio-check` on the Pi to see available devices.
-# Environment=RSC_HOST_AUDIO_INPUT=1
-# Environment=RSC_HOST_AUDIO_OUTPUT=1
-# Environment=RSC_HOST_AUDIO_SAMPLERATE=16000
-# Environment=RSC_HOST_AUDIO_CHANNELS=1
-ExecStart=/home/%i/host/.venv/bin/python -m rsc_host
+Environment=PYTHONUNBUFFERED=1
+# RSC_HOST_TOKEN comes from the drop-in at
+# /etc/systemd/system/rsc-host@rsc.service.d/token.conf — left alone by this
+# file, so reinstalling the unit does not regenerate the token.
 
-# Safe restart: crash / hardware hiccup / pigpiod restart → we come back too.
+# Releasing a chardev line reverts the pin to input, which floats Q1's gate and
+# lights the arcade LED. pinctrl writes the pad registers directly, so its state
+# survives process exit — it is the part that actually sticks. Nothing here
+# survives SIGKILL; the durable fix is a pull-down on the gate.
+ExecStopPost=-/usr/bin/pinctrl set 24 op dl
+
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 
-# Group membership required for GPIO / SPI / audio / serial access.
-SupplementaryGroups=gpio spi audio dialout i2c
+# Give the daemon time to cease servo pulses and release lines before SIGKILL.
+TimeoutStopSec=10
+KillSignal=SIGINT
 
-# Reasonable resource caps for a small always-on service.
-LimitNOFILE=4096
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -90,6 +90,13 @@
     button.action:hover { background: var(--panel-hi); border-color: var(--accent); }
     button.action:active { transform: translateY(1px); }
     button.action[disabled] { opacity: 0.4; cursor: not-allowed; }
+    button.action.wide { grid-column: 1 / -1; }
+    .hint {
+        font-size: 12px;
+        color: var(--fg-dim);
+        margin: 6px 0 0;
+        line-height: 1.5;
+    }
     .verb-row {
         display: flex;
         gap: 6px;
@@ -123,6 +130,7 @@
     .log .entry.err   { border-left-color: var(--err);    color: var(--err); }
     .log .entry.event { border-left-color: var(--warn);   color: var(--fg); }
     .log .entry.info  { border-left-color: var(--fg-dim); color: var(--fg-dim); }
+    .log .entry.level { border-left-color: var(--ok);     color: var(--ok); }
     .log .ts { color: var(--fg-dim); margin-right: 8px; }
     .clear-btn {
         position: sticky;
@@ -156,6 +164,8 @@
     <div class="grid">
         <button class="action" data-verb="ping">ping</button>
         <button class="action" data-verb="status">status</button>
+        <button class="action" data-verb="peripherals.status">peripherals</button>
+        <button class="action" data-verb="ring.status">ring status</button>
     </div>
 
     <h2>Flippers</h2>
@@ -166,7 +176,19 @@
         <button class="action" data-verb="flipper.right" data-args='{"speed":0.5,"ramp_ms":300}'>right fwd 0.5</button>
         <button class="action" data-verb="flipper.right" data-args='{"speed":-0.5,"ramp_ms":300}'>right rev 0.5</button>
         <button class="action" data-verb="flipper.right.stop">right stop</button>
+        <button class="action wide" data-verb="flipper.stop_all">stop all</button>
     </div>
+
+    <h2>Servo calibration</h2>
+    <div class="grid">
+        <button class="action wide" data-verb="servo.calibration">read calibration</button>
+    </div>
+    <p class="hint">
+        null_us is where the servo is genuinely still. span_us is the deflection
+        that means full speed, and is where a mismatch between two physical
+        servos gets corrected. Different quantities &mdash; changing one does
+        not imply the other. Adjust with servo.calibrate in the custom box.
+    </p>
 
     <h2>Ring</h2>
     <div class="grid">
@@ -193,24 +215,66 @@
         <button class="action" data-verb="cyd.mood_cycle">mood_cycle</button>
     </div>
 
-    <h2>Audio</h2>
+    <h2>Audio &mdash; test</h2>
     <div class="grid">
-        <button class="action" data-verb="audio.devices">devices</button>
+        <button class="action wide" data-verb="audio.selftest" data-args='{"seconds":3,"playback":true}'>record 3s + play back</button>
+        <button class="action" data-verb="audio.selftest" data-args='{"seconds":3,"playback":false}'>record only</button>
         <button class="action" data-verb="audio.stop_play">stop play</button>
     </div>
+    <p class="hint">
+        Speak while it records. Peak and RMS come back with the result: speech
+        at a normal distance lands near &minus;30 dBFS RMS with peaks around
+        &minus;10. Below &minus;60 means the mic is not hearing you, which is a
+        mixer problem rather than a code one.
+    </p>
+
+    <h2>Audio &mdash; capture chain</h2>
+    <div class="grid">
+        <button class="action" data-verb="audio.capture.config">config</button>
+        <button class="action" data-verb="audio.devices">devices</button>
+        <button class="action" data-verb="audio.capture.stats">stats</button>
+        <button class="action" data-verb="audio.capture.stats.reset">reset stats</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"stream_rate":16000}'>rate 16k</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"stream_rate":48000}'>rate 48k</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"channel_mode":"left"}'>channel left</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"channel_mode":"right"}'>channel right</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"hpf_hz":80}'>hpf 80 Hz</button>
+        <button class="action" data-verb="audio.capture.tune" data-args='{"hpf_mode":"off"}'>hpf off</button>
+    </div>
+    <p class="hint">
+        Capture is fixed at 48 kHz stereo &mdash; asking ALSA for 16k directly
+        warbles on this driver. The wire rate is reached by integer decimation,
+        which also removes the aliased converter tones above 6 kHz.
+    </p>
+
+    <h2>Audio &mdash; mixer</h2>
+    <div class="grid">
+        <button class="action" data-verb="audio.mixer.get">get all</button>
+        <button class="action" data-verb="audio.mixer.preset">apply preset</button>
+        <button class="action" data-verb="audio.mixer.set" data-args='{"name":"Left Input Boost Mixer LINPUT1","value":"3"}'>boost L = 3</button>
+        <button class="action" data-verb="audio.mixer.set" data-args='{"name":"Right Input Boost Mixer RINPUT1","value":"3"}'>boost R = 3</button>
+        <button class="action" data-verb="audio.mixer.set" data-args='{"name":"Capture","value":"35"}'>capture 35</button>
+        <button class="action" data-verb="audio.mixer.store">store state</button>
+    </div>
+    <p class="hint">
+        Gain belongs in the analogue boost ahead of the ADC, not in the digital
+        Capture control behind it. Boost lifts signal relative to the noise
+        floor; Capture lifts both equally. Store persists to asound.state so the
+        setting survives a reboot.
+    </p>
 
     <h2>Custom verb</h2>
     <div class="verb-row">
-        <input id="customVerb" placeholder="verb (e.g. cyd.mood)">
+        <input id="customVerb" placeholder="verb (e.g. servo.calibrate)">
         <button id="customSend">send</button>
     </div>
     <div class="verb-row">
-        <input id="customArgs" placeholder='args JSON (e.g. {"value":"HAPPY"})'>
+        <input id="customArgs" placeholder='args JSON (e.g. {"id":"right","null_us":1510})'>
     </div>
 
     <h2>Events</h2>
     <div class="grid">
-        <button class="action" id="historyBtn">history (last 20)</button>
+        <button class="action wide" id="historyBtn">history (last 20)</button>
     </div>
 </div>
 
@@ -292,6 +356,37 @@ function send(verb, args) {
     const msg = { type: "cmd", id, verb, args: args || {} };
     ws.send(JSON.stringify(msg));
     log("sent", `→ ${verb}  ${JSON.stringify(args || {})}`);
+
+    // audio.selftest blocks for the record duration, then again for playback.
+    // Without a note the console looks hung for six seconds.
+    if (verb === "audio.selftest") {
+        const secs = (args && args.seconds) || 3;
+        const total = (args && args.playback === false) ? secs : secs * 2;
+        log("info", `recording ${secs}s — speak now (result in ~${total}s)`);
+    }
+}
+
+// Levels are the point of the selftest, so pull them out of the result rather
+// than leaving them buried in a JSON blob. Peak and RMS are judged separately:
+// clipping is a distortion fault that a healthy RMS will happily hide, and
+// clipped samples generate harmonics that alias badly through decimation.
+function reportLevels(result) {
+    if (!result || result.rms_dbfs === undefined) return;
+    const rms = result.rms_dbfs;
+    const peak = result.peak_dbfs;
+    const verdict =
+        rms < -60 ? "SILENT — check the mixer, the mic is not hearing you" :
+        rms < -45 ? "quiet — speak closer, or raise the analogue boost" :
+        rms > -12 ? "very hot — lower Capture" :
+                    "healthy";
+    log("level", `  levels: rms ${rms} dBFS, peak ${peak} dBFS  →  ${verdict}`);
+    if (peak >= -0.5) {
+        log("err", "  CLIPPING — peak is at the rail. Lower Capture and retest; "
+                 + "clipped samples distort and alias, so judge nothing until this is clear.");
+    }
+    if (result.path) {
+        log("level", `  written to ${result.path} (${result.bytes} bytes, ${result.seconds}s)`);
+    }
 }
 
 $("connectBtn").addEventListener("click", () => {
@@ -341,6 +436,7 @@ $("connectBtn").addEventListener("click", () => {
         if (msg.type === "ack") {
             if (msg.ok) {
                 log("ack", `← [${msg.id}] ok  ${JSON.stringify(msg.result ?? {})}`);
+                reportLevels(msg.result);
             } else {
                 log("err", `← [${msg.id}] ${msg.code}: ${msg.message}`);
             }

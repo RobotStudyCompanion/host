@@ -1,0 +1,36 @@
+[Unit]
+# Root-only NeoPixel helper.
+#
+# The ring sits on GPIO12 = PWM0. Driving SKC6812 timing from PWM0 means
+# feeding the peripheral by DMA, and that means mapping /dev/mem. /dev/gpiomem
+# — the unprivileged path the button, LED and servos use — exposes only the
+# GPIO register block, so no group membership or udev rule avoids root here.
+#
+# Confining root to this ~300-line helper keeps the main daemon unprivileged.
+#
+# After=basic.target, NOT multi-user.target. This unit is WantedBy
+# multi-user.target, so ordering it After the same target is a cycle; systemd
+# resolves that by deleting a job, and it picks rsc-host.
+Description=RSC NeoPixel ring helper (root)
+After=basic.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/rsc/rsc-env/bin/python -m rsc_host.ring_helper
+WorkingDirectory=/home/rsc/rsc-host
+
+# systemd creates /run/rsc before the helper starts and removes it on stop.
+# The helper chowns the socket itself to root:gpio 0660 so the daemon, which
+# runs as a gpio-group user, can open it.
+RuntimeDirectory=rsc
+RuntimeDirectoryMode=0755
+
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
