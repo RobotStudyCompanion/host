@@ -324,6 +324,14 @@ class AudioBackend(Backend):
         """Apply the known-good mixer state for this hardware."""
         raise self._unsupported("mixer control")
 
-    async def mixer_store(self, path: str = "/var/lib/alsa/asound.state") -> dict:
-        """Persist the mixer state so it survives a reboot."""
+    async def mixer_store(self) -> dict:
+        """Persist user mixer changes so they survive a restart.
+
+        Backends write to storage they own rather than to a file requiring
+        privilege, because the console is the only surface some users have.
+        """
+        raise self._unsupported("mixer persistence")
+
+    async def mixer_reset(self) -> dict:
+        """Discard stored changes and return to the shipped preset."""
         raise self._unsupported("mixer persistence")
