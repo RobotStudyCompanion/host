@@ -34,6 +34,7 @@ from rsc_host.hal.base import (
     ServoBackend,
 )
 from rsc_host.hal.types import Colour, Edge, GpioEdge
+from rsc_host.state import StateStore
 
 log = logging.getLogger(__name__)
 
@@ -320,7 +321,8 @@ class FakeAudio(AudioBackend):
     *when* it finished.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state: StateStore | None = None) -> None:
+        self._state = state
         self._played: list[bytes] = []
         self._streamed: list[dict] = []
         self._capture_callback: AudioCallback | None = None
@@ -330,13 +332,17 @@ class FakeAudio(AudioBackend):
         # (it needs numpy) and only when a frame is actually pushed through.
         self._capture_config: object | None = None
         self._chain: object | None = None
-        self._mixer: dict[str, str] = {
+        # The shipped recipe, kept pristine so a reset has something to
+        # return to; _mixer is the live state on top of it.
+        self._preset: dict[str, str] = {
             "ALC Function": "Off",
             "ADC High Pass Filter": "on",
             "Left Input Boost Mixer LINPUT1": "3",
             "Capture": "35",
             "Playback": "255",
         }
+        self._mixer: dict[str, str] = dict(self._preset)
+        self._user_mixer: dict[str, str] = {}
         self._devices: dict = {
             "input":  [{"index": 0, "name": "Fake Mic",     "channels": 1, "samplerate": 16000}],
             "output": [{"index": 0, "name": "Fake Speaker", "channels": 2, "samplerate": 48000}],
@@ -349,6 +355,7 @@ class FakeAudio(AudioBackend):
 
     async def start(self) -> None:
         self._running = True
+        await self._apply_mixer_overlay()
         log.info("FakeAudio started")
 
     async def stop(self) -> None:
@@ -439,13 +446,60 @@ class FakeAudio(AudioBackend):
 
     async def mixer_set(self, name: str, value: str) -> dict:
         self._mixer[name] = value
-        return {"control": name, "value": value}
+        self._user_mixer[name] = value
+        return {
+            "control": name,
+            "value": value,
+            "pending": True,
+            "stored": False,
+            "hint": "call audio.mixer.store to keep this across a restart",
+        }
 
     async def mixer_apply_preset(self) -> dict:
-        return {name: "ok" for name in self._mixer}
+        self._mixer.update(self._preset)
+        return {name: "ok" for name in self._preset}
 
-    async def mixer_store(self, path: str = "/var/lib/alsa/asound.state") -> dict:
-        return {"stored": True, "path": path}
+    async def mixer_store(self) -> dict:
+        """Same overlay semantics as the Pi backend, so a laptop session
+        exercises the persistence path the robot actually uses rather than a
+        stub that always claims success."""
+        if self._state is None or not self._state.available:
+            reason = self._state.reason if self._state else "no state store"
+            return {
+                "stored": False,
+                "reason": f"no writable state directory ({reason})",
+                "fix": "add StateDirectory=rsc-host to the systemd unit",
+            }
+        if not self._user_mixer:
+            return {
+                "stored": False,
+                "reason": "nothing to store; no mixer control has been changed",
+                "hint": "set a control with audio.mixer.set first",
+            }
+        path = self._state.write("mixer", dict(self._user_mixer))
+        return {"stored": True, "path": str(path), "controls": dict(self._user_mixer)}
+
+    async def mixer_reset(self) -> dict:
+        removed = bool(
+            self._state and self._state.available and self._state.delete("mixer")
+        )
+        self._user_mixer.clear()
+        applied = await self.mixer_apply_preset()
+        return {
+            "reset": True,
+            "overlay_removed": removed,
+            "preset_controls": len(applied),
+        }
+
+    async def _apply_mixer_overlay(self) -> dict:
+        if self._state is None or not self._state.available:
+            return {}
+        stored = self._state.read("mixer")
+        for name, value in stored.items():
+            if isinstance(value, str):
+                self._mixer[name] = value
+                self._user_mixer[name] = value
+        return {name: "ok" for name in stored}
 
     # ---- Test hooks ----
 
