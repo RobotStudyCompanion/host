@@ -91,6 +91,27 @@
     button.action:active { transform: translateY(1px); }
     button.action[disabled] { opacity: 0.4; cursor: not-allowed; }
     button.action.wide { grid-column: 1 / -1; }
+    .slider-row {
+        display: grid;
+        grid-template-columns: 52px 1fr 56px;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+    .slider-row label {
+        font-size: 12px;
+        color: var(--fg-dim);
+    }
+    .slider-row output {
+        font: 12px var(--mono);
+        text-align: right;
+        color: var(--fg);
+    }
+    .slider-row input[type=range] {
+        width: 100%;
+        accent-color: var(--accent);
+        background: transparent;
+    }
     .hint {
         font-size: 12px;
         color: var(--fg-dim);
@@ -132,6 +153,18 @@
     .log .entry.info  { border-left-color: var(--fg-dim); color: var(--fg-dim); }
     .log .entry.level { border-left-color: var(--ok);     color: var(--ok); }
     .log .ts { color: var(--fg-dim); margin-right: 8px; }
+    .clear-btn button {
+        padding: 4px 10px;
+        margin-left: 6px;
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--panel-hi);
+        border-radius: 6px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+    }
+    .clear-btn button:hover { background: var(--panel-hi); border-color: var(--accent); }
     .clear-btn {
         position: sticky;
         top: 0;
@@ -179,10 +212,49 @@
         <button class="action wide" data-verb="flipper.stop_all">stop all</button>
     </div>
 
-    <h2>Servo calibration</h2>
-    <div class="grid">
-        <button class="action wide" data-verb="servo.calibration">read calibration</button>
+    <h2>Flipper speed</h2>
+    <div class="slider-row">
+        <label for="spdLeft">left</label>
+        <input type="range" id="spdLeft" min="-100" max="100" value="0" step="1">
+        <output id="spdLeftOut">0</output>
     </div>
+    <div class="slider-row">
+        <label for="spdRight">right</label>
+        <input type="range" id="spdRight" min="-100" max="100" value="0" step="1">
+        <output id="spdRightOut">0</output>
+    </div>
+    <div class="grid">
+        <button class="action" id="spdCentre">centre both</button>
+        <button class="action" data-verb="flipper.stop_all">stop all</button>
+    </div>
+    <p class="hint">
+        Drag to set speed directly, &minus;100 to +100. Sends at 10 Hz while
+        dragging and always sends the value you released on, so the robot
+        cannot be left running at a speed the slider is not showing.
+    </p>
+
+    <h2>Servo calibration</h2>
+    <div class="slider-row">
+        <label for="calNull">null &micro;s</label>
+        <input type="range" id="calNull" min="1400" max="1600" value="1500" step="1">
+        <output id="calNullOut">1500</output>
+    </div>
+    <div class="grid">
+        <button class="action" id="calTargetLeft">tuning: left</button>
+        <button class="action" id="calTargetRight">tuning: right</button>
+        <button class="action wide" data-verb="servo.calibration">read calibration</button>
+        <button class="action wide" data-verb="servo.calibration.store">keep calibration</button>
+        <button class="action wide" data-verb="servo.calibration.reset">reset to shipped</button>
+    </div>
+    <p class="hint">
+        <b>null &micro;s</b> is where the servo is genuinely still. Pick a side,
+        then drag until it stops creeping &mdash; changes apply live and are
+        forgotten on restart until you press <b>keep calibration</b>.
+        <b>span &micro;s</b> is a different quantity: the deflection meaning
+        full speed, and where a speed mismatch between the two physical servos
+        gets corrected. Set it from the custom box with
+        <code>servo.calibrate</code>.
+    </p>
     <p class="hint">
         null_us is where the servo is genuinely still. span_us is the deflection
         that means full speed, and is where a mismatch between two physical
@@ -318,7 +390,11 @@
 <div class="log" id="log">
     <div class="clear-btn">
         <span>event log</span>
-        <button id="clearBtn">clear</button>
+        <span>
+            <button id="copyBtn">copy</button>
+            <button id="saveBtn">save</button>
+            <button id="clearBtn">clear</button>
+        </span>
     </div>
 </div>
 
@@ -512,6 +588,50 @@ $("clearBtn").addEventListener("click", () => {
     logEl.querySelectorAll(".entry").forEach(e => e.remove());
 });
 
+// The log is the only record of a session, and these sessions are how
+// hardware behaviour gets established. textContent rather than innerHTML so
+// what lands on the clipboard is what is on screen, not markup.
+function logAsText() {
+    return [...logEl.querySelectorAll(".entry")]
+        .map(e => e.textContent)
+        .join("\n");
+}
+
+$("copyBtn").addEventListener("click", async () => {
+    const text = logAsText();
+    if (!text) return;
+    try {
+        await navigator.clipboard.writeText(text);
+        log("info", `copied ${text.split("\n").length} lines to the clipboard`);
+    } catch {
+        // Clipboard access needs a secure context, and the console is served
+        // over plain http on a LAN. Fall back to a selectable textarea rather
+        // than failing silently.
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;top:10%;left:10%;width:80%;height:70%;z-index:9999";
+        document.body.appendChild(ta);
+        ta.select();
+        log("info", "clipboard blocked (needs https) — select and copy, then press Escape");
+        ta.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") ta.remove();
+        });
+    }
+});
+
+$("saveBtn").addEventListener("click", () => {
+    const text = logAsText();
+    if (!text) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rsc-console-${stamp}.log`;
+    a.click();
+    URL.revokeObjectURL(url);
+    log("info", `saved ${a.download}`);
+});
+
 // ---- Scan for RSCs on the LAN ----
 //
 // Browsers can't do real mDNS, so we probe candidate hostnames by opening
@@ -626,6 +746,105 @@ $("customSend").addEventListener("click", () => {
 $("historyBtn").addEventListener("click", () => {
     send("events.history", { limit: 20 });
 });
+
+
+// ---- Sliders ----
+//
+// Throttled at 10 Hz with a *trailing* send. A leading-edge throttle alone —
+// which is what the CYD firmware does today — drops the value you released on
+// whenever the release lands inside the quiet window, so the slider shows 80
+// while the robot sits at 52 and nothing visibly went wrong. Here the last
+// value is always delivered: either by the timer, or on release.
+
+function makeThrottledSender(intervalMs, send) {
+    let lastSent = 0;
+    let pending = null;
+    let timer = null;
+
+    function flush() {
+        timer = null;
+        if (pending === null) return;
+        const value = pending;
+        pending = null;
+        lastSent = Date.now();
+        send(value);
+    }
+
+    return {
+        update(value) {
+            const since = Date.now() - lastSent;
+            if (since >= intervalMs) {
+                lastSent = Date.now();
+                send(value);
+            } else {
+                pending = value;
+                if (timer === null) timer = setTimeout(flush, intervalMs - since);
+            }
+        },
+        // Called on release: guarantees the final position reaches the robot
+        // even if the timer has not fired yet.
+        commit(value) {
+            if (timer !== null) { clearTimeout(timer); timer = null; }
+            pending = null;
+            lastSent = Date.now();
+            send(value);
+        },
+    };
+}
+
+function wireSpeedSlider(sliderId, outputId, verb) {
+    const slider = $(sliderId);
+    const out = $(outputId);
+    if (!slider) return null;
+    const sender = makeThrottledSender(100, (v) => send(verb, { speed: v / 100 }));
+    slider.addEventListener("input", () => {
+        out.textContent = slider.value;
+        sender.update(Number(slider.value));
+    });
+    // change fires on release for mouse, touch and keyboard alike.
+    slider.addEventListener("change", () => {
+        out.textContent = slider.value;
+        sender.commit(Number(slider.value));
+    });
+    return slider;
+}
+
+const spdLeft = wireSpeedSlider("spdLeft", "spdLeftOut", "flipper.left");
+const spdRight = wireSpeedSlider("spdRight", "spdRightOut", "flipper.right");
+
+$("spdCentre").addEventListener("click", () => {
+    for (const [slider, outId] of [[spdLeft, "spdLeftOut"], [spdRight, "spdRightOut"]]) {
+        if (!slider) continue;
+        slider.value = 0;
+        $(outId).textContent = "0";
+    }
+    send("flipper.stop_all", {});
+});
+
+// Calibration slider targets one servo at a time — null_us is per-servo, and
+// applying a value to both at once would undo the measurement you just made
+// on the other one.
+let calTarget = "left";
+function setCalTarget(id) {
+    calTarget = id;
+    $("calTargetLeft").style.borderColor = id === "left" ? "var(--accent)" : "";
+    $("calTargetRight").style.borderColor = id === "right" ? "var(--accent)" : "";
+    log("info", `calibration slider now targets the ${id} servo`);
+}
+$("calTargetLeft").addEventListener("click", () => setCalTarget("left"));
+$("calTargetRight").addEventListener("click", () => setCalTarget("right"));
+
+const calSender = makeThrottledSender(150, (v) =>
+    send("servo.calibrate", { id: calTarget, null_us: v })
+);
+$("calNull").addEventListener("input", () => {
+    $("calNullOut").textContent = $("calNull").value;
+    calSender.update(Number($("calNull").value));
+});
+$("calNull").addEventListener("change", () => {
+    calSender.commit(Number($("calNull").value));
+});
+setCalTarget("left");
 
 // Initial state
 setStatus("disconnected", "disconnected");

@@ -212,9 +212,14 @@ class PiServoBackend(ServoBackend):
         chip: int = 0,
         deadband: float = 0.02,
         idle_ms: int = 120,
+        state: StateStore | None = None,
     ) -> None:
         self._pins = dict(pins)
-        self._cal = dict(calibration or DEFAULT_CALIBRATION)
+        self._state = state
+        # The shipped values, kept pristine so a reset has somewhere to return
+        # to. _cal is those plus whatever the user has measured on top.
+        self._shipped = dict(calibration or DEFAULT_CALIBRATION)
+        self._cal = {k: replace(v) for k, v in self._shipped.items()}
         self._chip_index = chip
         self._deadband = abs(deadband)
         self._idle_ms = max(0, idle_ms)
@@ -259,6 +264,8 @@ class PiServoBackend(ServoBackend):
                 ) from exc
             self._claimed.append(pin)
             self._cal.setdefault(servo_id, ServoCalibration()).validate(servo_id)
+
+        self._load_calibration()
 
         # Lines are claimed low and left unpulsed: servos stay inert until
         # commanded, so a restart mid-motion stops rather than resumes.
@@ -338,12 +345,94 @@ class PiServoBackend(ServoBackend):
             return {servo_id: cal.as_dict()}
         return {k: v.as_dict() for k, v in self._cal.items()}
 
+    SERVO_STATE_KEY = "servo"
+
+    def _load_calibration(self) -> None:
+        """Overlay stored calibration on the shipped defaults.
+
+        Runs at start. A field the user never touched keeps its shipped value,
+        so a later release that improves a default still improves it for
+        everyone who has not overridden that particular field.
+        """
+        if self._state is None or not self._state.available:
+            return
+        stored = self._state.read(self.SERVO_STATE_KEY)
+        if not stored:
+            return
+        applied = []
+        for servo_id, changes in stored.items():
+            if servo_id not in self._pins or not isinstance(changes, dict):
+                continue
+            known = {
+                k: v for k, v in changes.items()
+                if k in ServoCalibration.__dataclass_fields__
+            }
+            if not known:
+                continue
+            try:
+                base = self._shipped.get(servo_id, ServoCalibration())
+                self._cal[servo_id] = replace(base, **known).validate(servo_id)
+                applied.append(servo_id)
+            except (CalibrationError, ValueError, TypeError) as exc:
+                # A bad stored value must not stop the robot booting. The
+                # person who wrote it may have no shell to repair it with.
+                log.warning(
+                    "stored calibration for %s rejected (%s); using shipped "
+                    "values", servo_id, exc,
+                )
+        if applied:
+            log.info("servo calibration overlay applied for %s", ", ".join(applied))
+
+    def store_calibration(self) -> dict:
+        """Persist the differences from the shipped calibration."""
+        if self._state is None or not self._state.available:
+            reason = self._state.reason if self._state else "no state store"
+            return {
+                "stored": False,
+                "reason": f"no writable state directory ({reason})",
+                "fix": "add StateDirectory=rsc-host to the systemd unit",
+            }
+        diff: dict[str, dict] = {}
+        for servo_id, cal in self._cal.items():
+            base = self._shipped.get(servo_id, ServoCalibration())
+            changed = {
+                field: getattr(cal, field)
+                for field in ServoCalibration.__dataclass_fields__
+                if getattr(cal, field) != getattr(base, field)
+            }
+            if changed:
+                diff[servo_id] = changed
+        if not diff:
+            return {
+                "stored": False,
+                "reason": "calibration matches the shipped values; nothing to store",
+            }
+        path = self._state.write(self.SERVO_STATE_KEY, diff)
+        log.info("servo calibration stored -> %s", path)
+        return {"stored": True, "path": str(path), "calibration": diff}
+
+    def reset_calibration(self) -> dict:
+        """Discard measured values and return to the shipped calibration."""
+        removed = bool(
+            self._state
+            and self._state.available
+            and self._state.delete(self.SERVO_STATE_KEY)
+        )
+        self._cal = {k: replace(v) for k, v in self._shipped.items()}
+        log.info("servo calibration reset (overlay removed: %s)", removed)
+        return {
+            "reset": True,
+            "overlay_removed": removed,
+            "calibration": {k: v.as_dict() for k, v in self._cal.items()},
+        }
+
     def set_calibration(self, servo_id: str, **changes) -> dict:
         """Update calibration in memory and return the new values.
 
-        Changes apply from the next :meth:`set_speed`. They are *not*
-        persisted — write the values into the unit file's environment once a
-        confirming ``servo_null`` run agrees with them.
+        Applies from the next :meth:`set_speed`, and lasts until the daemon
+        restarts. :meth:`store_calibration` is what makes it permanent — the
+        split is deliberate, so sweeping through values while hunting for a
+        null costs nothing and is undone by a restart.
         """
         if servo_id not in self._pins:
             raise KeyError(f"unknown servo_id: {servo_id!r}")

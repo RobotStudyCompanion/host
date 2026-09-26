@@ -54,13 +54,15 @@ class FakeServo(ServoBackend):
     _DEFAULT_CAL = {"null_us": 1500, "span_us": 100, "invert": False,
                     "min_us": 900, "max_us": 2100}
 
-    def __init__(self) -> None:
+    def __init__(self, state: StateStore | None = None) -> None:
+        self._state = state
         self._speeds: dict[str, float] = {}
         self._cal: dict[str, dict] = {}
         self._running = False
 
     async def start(self) -> None:
         self._running = True
+        self._load_calibration()
         log.info("FakeServo started")
 
     async def stop(self) -> None:
@@ -78,6 +80,32 @@ class FakeServo(ServoBackend):
         for servo_id in self._speeds:
             self._speeds[servo_id] = 0.0
         log.info("FakeServo stop_all (%d servos)", len(self._speeds))
+
+    SERVO_STATE_KEY = "servo"
+
+    def store_calibration(self) -> dict:
+        if self._state is None or not self._state.available:
+            reason = self._state.reason if self._state else "no state store"
+            return {"stored": False, "reason": f"no writable state directory ({reason})"}
+        if not self._cal:
+            return {"stored": False, "reason": "nothing measured yet"}
+        path = self._state.write(self.SERVO_STATE_KEY, dict(self._cal))
+        return {"stored": True, "path": str(path), "calibration": dict(self._cal)}
+
+    def reset_calibration(self) -> dict:
+        removed = bool(
+            self._state and self._state.available
+            and self._state.delete(self.SERVO_STATE_KEY)
+        )
+        self._cal.clear()
+        return {"reset": True, "overlay_removed": removed, "calibration": {}}
+
+    def _load_calibration(self) -> None:
+        if self._state is None or not self._state.available:
+            return
+        for servo_id, changes in self._state.read(self.SERVO_STATE_KEY).items():
+            if isinstance(changes, dict):
+                self._cal[servo_id] = dict(changes)
 
     def calibration(self, servo_id: str | None = None) -> dict:
         if servo_id is not None:

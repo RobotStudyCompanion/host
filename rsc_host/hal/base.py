@@ -81,6 +81,14 @@ class ServoBackend(Backend):
             "calibration is not supported by this servo backend"
         )
 
+    def store_calibration(self) -> dict:
+        """Persist measured calibration so it survives a restart."""
+        raise self._unsupported("servo calibration persistence")
+
+    def reset_calibration(self) -> dict:
+        """Discard measured calibration, returning to shipped values."""
+        raise self._unsupported("servo calibration persistence")
+
     def set_calibration(self, servo_id: str, **changes) -> dict:
         """Update calibration in memory, from the next command onward.
 

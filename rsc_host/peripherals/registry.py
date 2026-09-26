@@ -180,7 +180,7 @@ def _build_backends(
         )
 
         return (
-            FakeServo(),
+            FakeServo(state=state),
             FakeRing(pixel_count=pinout.ring_pixel_count),
             FakeGpioInput(),
             FakeGpioPwm(),
@@ -250,6 +250,7 @@ def _build_backends(
             chip=servo.gpiochip,
             deadband=servo.deadband,
             idle_ms=servo.idle_ms,
+            state=state,
         ),
         PiRingBackend(
             pixel_count=pinout.ring_pixel_count,
@@ -358,6 +359,7 @@ class _ServoCalibrateArgs(BaseModel):
     null_us: int | None = Field(default=None, ge=500, le=2500)
     span_us: int | None = Field(default=None, ge=1, le=800)
     invert: bool | None = None
+    persist: bool = False
 
 
 class _CaptureTuneArgs(BaseModel):
@@ -593,6 +595,16 @@ async def setup(
     async def _servo_calibration(args: _ServoCalibrationArgs) -> dict:
         return {"calibration": servo_be.calibration(args.id)}
 
+    @dispatcher.verb("servo.calibration.store", args_model=_EmptyArgs)
+    async def _servo_calibration_store(_args: _EmptyArgs) -> dict:
+        """Keep the calibration measured since the daemon started."""
+        return servo_be.store_calibration()
+
+    @dispatcher.verb("servo.calibration.reset", args_model=_EmptyArgs)
+    async def _servo_calibration_reset(_args: _EmptyArgs) -> dict:
+        """Discard measured calibration and return to the shipped values."""
+        return servo_be.reset_calibration()
+
     @dispatcher.verb("servo.calibrate", args_model=_ServoCalibrateArgs)
     async def _servo_calibrate(args: _ServoCalibrateArgs) -> dict:
         changes = {
@@ -609,15 +621,16 @@ async def setup(
                 "nothing to change; pass at least one of null_us, span_us, invert"
             )
         updated = servo_be.set_calibration(args.id, **changes)
+        stored = servo_be.store_calibration() if args.persist else {"stored": False}
         return {
             "id": args.id,
             "calibration": updated,
-            "persisted": False,
+            "persisted": bool(stored.get("stored")),
             "hint": (
-                "in-memory only, and lost on restart. Once a second "
-                "calibration run agrees, write "
-                f"RSC_HOST_SERVO_{args.id.upper()}_NULL_US / _SPAN_US into the "
-                "unit file."
+                "kept across restarts"
+                if stored.get("stored")
+                else "in memory only, lost on restart; pass persist:true or "
+                     "call servo.calibration.store once a second run agrees"
             ),
         }
 
