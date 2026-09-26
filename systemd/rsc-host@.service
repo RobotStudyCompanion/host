@@ -34,6 +34,12 @@ ExecStart=/home/rsc/rsc-env/bin/python -m rsc_host
 # gpio for the chardev lines and the ring socket; audio for the WM8960.
 SupplementaryGroups=gpio audio
 
+# Creates /var/lib/rsc-host owned by this user before the daemon starts, and
+# exports the path as STATE_DIRECTORY. This is what lets a console-only user
+# keep a setting across a reboot: the daemon writes somewhere it owns rather
+# than needing a privilege it deliberately does not hold.
+StateDirectory=rsc-host
+
 Environment=RSC_HOST_BACKEND=pi
 Environment=RSC_HOST_BIND=0.0.0.0
 Environment=RSC_HOST_PORT=8765
