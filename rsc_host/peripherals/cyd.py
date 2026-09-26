@@ -85,6 +85,9 @@ class CydBridge:
         self._backend = backend
         self._bus = bus
         self._reader_task: asyncio.Task[None] | None = None
+        # None = not yet probed, True/False = firmware answered.
+        self._supports_push: bool | None = None
+        self._probe_reply: asyncio.Future[str] | None = None
 
     async def start(self) -> None:
         """Kick off the reader loop. Backend must already be started."""
@@ -123,6 +126,13 @@ class CydBridge:
         if not line:
             return
 
+        # A probe in flight claims the first line that answers it. Done before
+        # the event map so a reply cannot be mistaken for a front-panel action.
+        if self._probe_reply is not None and not self._probe_reply.done():
+            if line.startswith(("vol:", "ERR")):
+                self._probe_reply.set_result(line)
+                return
+
         prefix, _, payload = line.partition(":")
         entry = _CYD_EVENT_MAP.get(prefix)
         if entry is None:
@@ -137,6 +147,88 @@ class CydBridge:
             return
 
         await self._bus.publish(Event(topic=topic, source="cyd", data=data))
+
+
+    # ---- State push ----
+    #
+    # The panel keeps its own mute flags and flips them on every press, quite
+    # independently of what the host decides. Mute from the console and the
+    # panel's flag does not move; press the panel icon and it flips to whatever
+    # it was not, which may now agree with the host or invert it. Two sources
+    # of truth, drifting.
+    #
+    # The host is the authority — it owns the mixer — so it pushes state after
+    # every change and the panel follows. That needs `vol`, `mute` and `mic`
+    # commands in the CYD dispatch table, which do not exist yet. Rather than
+    # gate this on a flag somebody has to remember to flip, the bridge asks the
+    # firmware once at start and enables itself when the commands appear.
+
+    async def probe_push_support(self, timeout: float = 1.5) -> bool:
+        """Ask the firmware whether it can be told about volume state.
+
+        Sends ``vol?``. Current firmware answers ``ERR: unknown command``;
+        patched firmware answers ``vol: NN``. Either way the daemon carries on
+        — a panel that cannot be updated is the situation we already have.
+        """
+        loop = asyncio.get_running_loop()
+        self._probe_reply = loop.create_future()
+        try:
+            await self._backend.write_line("vol?")
+            reply = await asyncio.wait_for(self._probe_reply, timeout)
+        except (asyncio.TimeoutError, Exception) as exc:
+            self._supports_push = False
+            log.info(
+                "CYD state push disabled (no answer to 'vol?': %s). The panel "
+                "will show its own guess at volume and mute.",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            self._probe_reply = None
+
+        self._supports_push = reply.startswith("vol:")
+        if self._supports_push:
+            log.info("CYD state push enabled (firmware answered %r)", reply)
+        else:
+            log.info(
+                "CYD state push disabled (firmware lacks 'vol'); panel volume "
+                "and mute icons will drift from the host"
+            )
+        return self._supports_push
+
+    @property
+    def supports_push(self) -> bool:
+        return bool(self._supports_push)
+
+    async def push_state(
+        self,
+        *,
+        volume: int | None = None,
+        muted: bool | None = None,
+        mic_muted: bool | None = None,
+    ) -> dict:
+        """Tell the panel what the host believes. No-op when unsupported.
+
+        Silent by design when the firmware cannot accept it: this fires on
+        every volume change, and logging a warning each time would bury the
+        journal under a condition the operator already knows about.
+        """
+        if not self._supports_push:
+            return {"pushed": False, "reason": "firmware lacks state commands"}
+        sent: list[str] = []
+        if volume is not None:
+            sent.append(f"vol:{max(0, min(100, int(volume)))}")
+        if muted is not None:
+            sent.append(f"mute:{'on' if muted else 'off'}")
+        if mic_muted is not None:
+            sent.append(f"mic:{'on' if mic_muted else 'off'}")
+        for line in sent:
+            try:
+                await self._backend.write_line(line)
+            except Exception:
+                log.warning("CYD push failed for %r", line)
+                return {"pushed": False, "reason": "serial write failed"}
+        return {"pushed": True, "sent": sent}
 
     # ---- Writer ----
 

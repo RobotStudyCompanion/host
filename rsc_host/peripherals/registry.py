@@ -35,6 +35,7 @@ from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.state import StateStore
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
+from rsc_host.protocol import Event
 from rsc_host.hal.base import (
     AudioBackend,
     GpioInputBackend,
@@ -98,6 +99,7 @@ class Peripherals:
     button_led: ButtonLed
     cyd: CydBridge
     audio: Audio
+    cyd_control_task: asyncio.Task | None = None
 
     async def stop(self) -> None:
         """Stop peripherals in reverse order of construction, then backends.
@@ -113,6 +115,8 @@ class Peripherals:
             except Exception:
                 log.exception("failed to stop %s", what)
 
+        if self.cyd_control_task is not None:
+            self.cyd_control_task.cancel()
         await _quietly("audio capture", self.audio.stop_capture())
         await _quietly("audio playback", self.audio.stop_play())
         await _quietly("cyd", self.cyd.stop())
@@ -319,6 +323,8 @@ class _AudioSelftestArgs(BaseModel):
     seconds: float = Field(default=3.0, ge=0.5, le=30.0)
     playback: bool = True
     path: str = Field(default="/tmp/rsc_selftest.wav", max_length=512)
+    normalise: bool = True
+    target_dbfs: float = Field(default=-3.0, ge=-40.0, le=0.0)
     settle_ms: int = Field(
         default=250,
         ge=0,
@@ -384,11 +390,96 @@ class _MixerSetArgs(BaseModel):
     value: str = Field(max_length=64)
 
 
+class _VolumeArgs(BaseModel):
+    percent: int = Field(ge=0, le=100)
+    persist: bool = False
+
+
+class _MuteArgs(BaseModel):
+    muted: bool = True
+
+
 class _EmptyArgs(BaseModel):
     pass
 
 
 # ---- Setup ----
+
+
+
+# ---- CYD front-panel control ----
+
+
+async def _cyd_control_loop(
+    bus: EventBus, audio_be: AudioBackend, cyd: CydBridge
+) -> None:
+    """Make the front-panel knob and buttons do something.
+
+    The CYD bridge parses ``host_vol``, ``host_mute`` and ``host_mic`` into
+    events, but until now nothing subscribed, so turning the knob published
+    into the void. This closes that loop.
+
+    Only ``source == "cyd"`` events are acted on. The verbs publish their own
+    ``audio.volume`` and ``audio.mute`` events, and reacting to those would
+    have the daemon answering itself.
+
+    The volume the knob sets is *not* persisted. Someone fiddling with a
+    physical control is not declaring a preference, and writing the file on
+    every step of a turn would hammer the SD card. ``audio.volume`` with
+    ``persist: true`` is how a deliberate choice gets kept.
+    """
+    # Topic is mapped explicitly, not derived from the incoming name.
+    # Stripping the "host_" prefix looks tidy and produces "audio.vol" and
+    # "audio.mic", while the verbs publish "audio.volume" and "audio.mic_mute"
+    # — so the same state change would carry two different topic names
+    # depending on which surface caused it, and a client watching one would
+    # silently miss the other.
+    handlers: dict[str, tuple[str, object]] = {
+        "host_vol": (
+            "audio.volume",
+            lambda data: audio_be.set_volume(int(data.get("value", 0))),
+        ),
+        "host_mute": ("audio.mute", lambda _data: _toggle_mute(audio_be)),
+        "host_mic": ("audio.mic_mute", lambda _data: _toggle_mic(audio_be)),
+    }
+    async with bus.subscribe() as queue:
+        while True:
+            event = await queue.get()
+            if event.source != "cyd":
+                continue
+            entry = handlers.get(event.topic)
+            if entry is None:
+                continue
+            topic, handler = entry
+            try:
+                result = await handler(event.data or {})
+            except Exception:
+                # A front-panel press must never take the daemon down, and the
+                # person pressing it has no console to read a traceback from.
+                log.exception("cyd control %s failed", event.topic)
+                continue
+            # Push back even though the press came from the panel. Its mute
+            # flags are its own and it flips them blind, so after a press the
+            # two sides may disagree; this is where that gets corrected.
+            await cyd.push_state(
+                volume=result.get("volume"),
+                muted=result.get("muted"),
+                mic_muted=result.get("mic_muted"),
+            )
+            await bus.publish(
+                Event(topic=topic, source="host", data=dict(result))
+            )
+
+
+async def _toggle_mute(audio_be: AudioBackend) -> dict:
+    """The CYD sends a press, not a state, so the host owns the toggle."""
+    current = await audio_be.get_volume()
+    return await audio_be.set_mute(not current.get("muted", False))
+
+
+async def _toggle_mic(audio_be: AudioBackend) -> dict:
+    muted = bool(getattr(audio_be, "_mic_muted", False))
+    return await audio_be.set_mic_mute(not muted)
 
 
 async def setup(
@@ -459,6 +550,10 @@ async def setup(
 
     await button.start()
     await cyd.start()
+    # Ask the panel whether it can be told about volume state. Current firmware
+    # cannot, and says so; the daemon carries on either way and enables itself
+    # the moment patched firmware appears, with no config to remember.
+    await cyd.probe_push_support()
 
     flippers = {
         "left": flipper_left,
@@ -616,6 +711,7 @@ async def setup(
         Blocks for roughly ``seconds`` twice over when playback is on — once
         recording, once playing.
         """
+        import io
         import math
         import wave
 
@@ -699,13 +795,45 @@ async def setup(
         }
 
         if args.playback:
-            def _read() -> bytes:
-                with open(args.path, "rb") as fh:
-                    return fh.read()
+            # Normalise the playback copy, never the file on disk.
+            #
+            # Speech captured at a sane level peaks around -14 dBFS, and the
+            # JST speaker is small and already at 0 dB output, so playing the
+            # raw samples back is barely audible — which reads as "playback is
+            # broken" when the recording is in fact fine. The legacy rig
+            # normalised for exactly this reason.
+            #
+            # The file stays untouched so it remains an honest artefact for
+            # analysis, and the gain applied is reported so nobody mistakes a
+            # loud playback for a hot recording.
+            def _playback_bytes() -> tuple[bytes, float]:
+                if not args.normalise:
+                    with open(args.path, "rb") as fh:
+                        return fh.read(), 0.0
+                xs = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                peak = float(np.abs(xs).max())
+                if peak <= 0:
+                    with open(args.path, "rb") as fh:
+                        return fh.read(), 0.0
+                target = 32768.0 * (10.0 ** (args.target_dbfs / 20.0))
+                # Capped at 20x (26 dB), which only bites below about
+                # -29 dBFS peak. Without a ceiling a near-silent capture gets
+                # lifted until its noise floor fills the speaker, which sounds
+                # like a fault rather than like silence.
+                gain = min(target / peak, 20.0)
+                loud = np.clip(xs * gain, -32768, 32767).astype(np.int16)
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(channels)
+                    w.setsampwidth(width)
+                    w.setframerate(rate)
+                    w.writeframes(loud.tobytes())
+                return buf.getvalue(), round(20 * math.log10(gain), 1)
 
-            wav_bytes = await asyncio.to_thread(_read)
+            wav_bytes, gain_db = await asyncio.to_thread(_playback_bytes)
             await audio.play(wav_bytes, preempt=True)
             result["played"] = True
+            result["playback_gain_db"] = gain_db
         return result
 
     # ---- Capture chain tuning ----
@@ -771,6 +899,49 @@ async def setup(
         """Discard stored changes and go back to the shipped preset."""
         return await audio_be.mixer_reset()
 
+    # ---- Volume ----
+
+    async def _apply_volume(percent: int, persist: bool) -> dict:
+        result = await audio_be.set_volume(percent, persist=persist)
+        await cyd.push_state(volume=result.get("volume"), muted=False)
+        await bus.publish(
+            Event(topic="audio.volume", source="host", data=dict(result))
+        )
+        return result
+
+    @dispatcher.verb("audio.volume", args_model=_VolumeArgs)
+    async def _audio_volume(args: _VolumeArgs) -> dict:
+        """Set output volume, 0..100, where 100 is 0 dB.
+
+        ``persist`` keeps it across a restart; without it the setting lasts
+        until the daemon stops.
+        """
+        return await _apply_volume(args.percent, args.persist)
+
+    @dispatcher.verb("audio.volume.get", args_model=_EmptyArgs)
+    async def _audio_volume_get(_args: _EmptyArgs) -> dict:
+        return await audio_be.get_volume()
+
+    @dispatcher.verb("audio.mute", args_model=_MuteArgs)
+    async def _audio_mute(args: _MuteArgs) -> dict:
+        """Mute or unmute output. Never persisted — see the backend."""
+        result = await audio_be.set_mute(args.muted)
+        await cyd.push_state(muted=result.get("muted"))
+        await bus.publish(
+            Event(topic="audio.mute", source="host", data=dict(result))
+        )
+        return result
+
+    @dispatcher.verb("audio.mic_mute", args_model=_MuteArgs)
+    async def _audio_mic_mute(args: _MuteArgs) -> dict:
+        """Disconnect or reconnect the microphone in hardware."""
+        result = await audio_be.set_mic_mute(args.muted)
+        await cyd.push_state(mic_muted=result.get("mic_muted"))
+        await bus.publish(
+            Event(topic="audio.mic_mute", source="host", data=dict(result))
+        )
+        return result
+
     # ---- Status ----
 
     # Named peripherals.status, not status: __main__ owns the bare "status"
@@ -810,7 +981,13 @@ async def setup(
             # place in the snapshot: a user whose stored tweak silently failed
             # to persist has no other way to find out.
             "state": _safe(store.status),
-            "cyd": {"available": getattr(serial_be, "available", True)},
+            "cyd": {
+                "available": getattr(serial_be, "available", True),
+                # False means the panel's volume and mute icons are its own
+                # guess and will drift from the host. Visible here so the
+                # disagreement is diagnosable rather than merely confusing.
+                "state_push": cyd.supports_push,
+            },
             "audio": {
                 "capturing": audio.is_capturing,
                 "playing": audio.is_playing,
@@ -835,6 +1012,12 @@ async def setup(
         len(curated_cyd_verbs()),
     )
 
+    # Started here rather than by the caller: the loop is part of what makes
+    # the peripherals work, and Peripherals.stop() owns its cancellation.
+    control_task = asyncio.create_task(
+        _cyd_control_loop(bus, audio_be, cyd), name="cyd-control"
+    )
+
     return Peripherals(
         servo_backend=servo_be,
         ring_backend=ring_be,
@@ -850,4 +1033,5 @@ async def setup(
         button_led=button_led,
         cyd=cyd,
         audio=audio,
+        cyd_control_task=control_task,
     )

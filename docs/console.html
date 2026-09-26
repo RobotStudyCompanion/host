@@ -218,14 +218,44 @@
     <h2>Audio &mdash; test</h2>
     <div class="grid">
         <button class="action wide" data-verb="audio.selftest" data-args='{"seconds":3,"playback":true}'>record 3s + play back</button>
+        <button class="action" data-verb="audio.selftest" data-args='{"seconds":3,"playback":true,"normalise":false}'>play back raw</button>
         <button class="action" data-verb="audio.selftest" data-args='{"seconds":3,"playback":false}'>record only</button>
-        <button class="action" data-verb="audio.stop_play">stop play</button>
+        <button class="action wide" data-verb="audio.stop_play">stop play</button>
     </div>
     <p class="hint">
         Speak while it records. Peak and RMS come back with the result: speech
         at a normal distance lands near &minus;30 dBFS RMS with peaks around
         &minus;10. Below &minus;60 means the mic is not hearing you, which is a
         mixer problem rather than a code one.
+    </p>
+    <p class="hint">
+        Playback is normalised to &minus;3 dBFS so you can hear it &mdash; a
+        good recording peaks near &minus;14, and the small speaker at 0 dB
+        makes that barely audible. The file on disk stays raw, and the gain
+        applied is reported, so a loud playback is never mistaken for a hot
+        recording. <b>Play back raw</b> skips it.
+    </p>
+
+    <h2>Audio &mdash; volume</h2>
+    <div class="grid">
+        <button class="action" data-verb="audio.volume" data-args='{"percent":25}'>25%</button>
+        <button class="action" data-verb="audio.volume" data-args='{"percent":50}'>50%</button>
+        <button class="action" data-verb="audio.volume" data-args='{"percent":75}'>75%</button>
+        <button class="action" data-verb="audio.volume" data-args='{"percent":100}'>100%</button>
+        <button class="action" data-verb="audio.mute" data-args='{"muted":true}'>mute</button>
+        <button class="action" data-verb="audio.mute" data-args='{"muted":false}'>unmute</button>
+        <button class="action" data-verb="audio.mic_mute" data-args='{"muted":true}'>mic off</button>
+        <button class="action" data-verb="audio.mic_mute" data-args='{"muted":false}'>mic on</button>
+        <button class="action wide" data-verb="audio.volume.get">read volume</button>
+    </div>
+    <p class="hint">
+        Volume attenuates the analogue output, leaving the DAC at full scale,
+        so 100% is 0 dB rather than the amplifier's ceiling. Add
+        <code>{"persist":true}</code> in the custom box to keep a level across
+        restarts; the CYD knob does not persist, since turning a dial is not
+        the same as choosing a setting. Mute never persists &mdash; a robot
+        that booted silent would give you nothing to go on. Mic off disconnects
+        the input in hardware.
     </p>
 
     <h2>Audio &mdash; capture chain</h2>

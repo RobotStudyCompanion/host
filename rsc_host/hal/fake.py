@@ -343,6 +343,9 @@ class FakeAudio(AudioBackend):
         }
         self._mixer: dict[str, str] = dict(self._preset)
         self._user_mixer: dict[str, str] = {}
+        self._volume = 100
+        self._muted = False
+        self._mic_muted = False
         self._devices: dict = {
             "input":  [{"index": 0, "name": "Fake Mic",     "channels": 1, "samplerate": 16000}],
             "output": [{"index": 0, "name": "Fake Speaker", "channels": 2, "samplerate": 48000}],
@@ -356,6 +359,7 @@ class FakeAudio(AudioBackend):
     async def start(self) -> None:
         self._running = True
         await self._apply_mixer_overlay()
+        await self._restore_audio_state()
         log.info("FakeAudio started")
 
     async def stop(self) -> None:
@@ -490,6 +494,31 @@ class FakeAudio(AudioBackend):
             "overlay_removed": removed,
             "preset_controls": len(applied),
         }
+
+    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
+        self._volume = max(0, min(100, int(percent)))
+        self._muted = False
+        if persist and self._state and self._state.available:
+            self._state.write("audio", {"volume": self._volume})
+        return {"volume": self._volume, "muted": False, "persisted": persist}
+
+    async def get_volume(self) -> dict:
+        return {"volume": self._volume, "muted": self._muted}
+
+    async def set_mute(self, muted: bool) -> dict:
+        self._muted = bool(muted)
+        return {"muted": self._muted, "volume": self._volume}
+
+    async def set_mic_mute(self, muted: bool) -> dict:
+        self._mic_muted = bool(muted)
+        return {"mic_muted": self._mic_muted}
+
+    async def _restore_audio_state(self) -> None:
+        if self._state is None or not self._state.available:
+            return
+        volume = self._state.read("audio").get("volume")
+        if isinstance(volume, int) and 0 <= volume <= 100:
+            self._volume = volume
 
     async def _apply_mixer_overlay(self) -> dict:
         if self._state is None or not self._state.available:

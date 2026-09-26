@@ -999,6 +999,9 @@ class PiAudioBackend(AudioBackend):
         # Recording what was set keeps the overlay replayable by construction,
         # and keeps it a record of *changes* rather than a full state dump.
         self._user_mixer: dict[str, str] = {}
+        self._volume = 100
+        self._muted = False
+        self._mic_muted = False
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._chain: CaptureChain | None = None
@@ -1033,6 +1036,7 @@ class PiAudioBackend(AudioBackend):
         # floor and the user's room wins where it differs. A fresh robot has no
         # overlay, so the preset stands alone and works untouched.
         await self._apply_mixer_overlay()
+        await self._restore_audio_state()
         log.info(
             "PiAudioBackend started (in=%s, out=%s, %d Hz %d ch -> %d Hz mono)",
             self._input_device, self._output_device,
@@ -1410,6 +1414,16 @@ class PiAudioBackend(AudioBackend):
             out[name] = self._parse_amixer(text) if rc == 0 else None
         return {"card": self._mixer_card, "controls": out}
 
+    async def _set_control(self, name: str, value: str) -> bool:
+        """Set a control *without* recording it for the overlay.
+
+        Mute and volume use this. Recording them would be actively harmful:
+        a stored mute would survive a reboot, leaving a console-only user with
+        a silent robot, no visible cause, and no shell to investigate with.
+        """
+        rc, _ = await self._amixer("sset", name, value)
+        return rc == 0
+
     async def mixer_set(self, name: str, value: str) -> dict:
         """Set one control, and remember the value for the overlay.
 
@@ -1436,6 +1450,100 @@ class PiAudioBackend(AudioBackend):
             rc, _ = await self._amixer("sset", name, value)
             results[name] = "ok" if rc == 0 else "skipped"
         return results
+
+
+    # ---- Volume, mute and microphone mute ----
+    #
+    # Volume attenuates in the analogue output stage (`Speaker`, `Headphone`)
+    # rather than the digital `Playback` control. Cutting level before the DAC
+    # throws away bits; cutting after it does not — the same reasoning that
+    # puts capture gain in the analogue boost ahead of the ADC.
+    #
+    # 100% maps to 121, which is 0 dB on this codec. The control goes to 127,
+    # but that is boost into the amplifier's headroom rather than useful range.
+
+    #: Analogue output controls that carry volume, and the index meaning 0 dB.
+    VOLUME_CONTROLS: tuple[str, ...] = ("Speaker", "Headphone")
+    VOLUME_0DB = 121
+    AUDIO_STATE_KEY = "audio"
+
+    #: Input path switch. Turning this off disconnects the microphone in
+    #: hardware, so a mic mute is not something a software fault can bypass.
+    MIC_SWITCHES: tuple[str, ...] = (
+        "Left Boost Mixer LINPUT1",
+        "Right Boost Mixer RINPUT1",
+    )
+
+    @staticmethod
+    def _percent_to_index(percent: int) -> int:
+        return max(0, min(100, int(percent))) * PiAudioBackend.VOLUME_0DB // 100
+
+    @staticmethod
+    def _index_to_percent(index: int) -> int:
+        return max(0, min(100, round(index * 100 / PiAudioBackend.VOLUME_0DB)))
+
+    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
+        """Set output volume as 0..100, where 100 is 0 dB.
+
+        Unmutes if muted, because a user turning the volume up expects sound.
+        """
+        percent = max(0, min(100, int(percent)))
+        index = self._percent_to_index(percent)
+        applied = [c for c in self.VOLUME_CONTROLS
+                   if await self._set_control(c, str(index))]
+        self._volume = percent
+        self._muted = False
+        if persist:
+            self._persist_audio_state()
+        return {
+            "volume": percent,
+            "index": index,
+            "muted": False,
+            "controls": applied,
+            "persisted": persist,
+        }
+
+    async def get_volume(self) -> dict:
+        return {
+            "volume": self._volume,
+            "muted": self._muted,
+            "index": self._percent_to_index(self._volume),
+        }
+
+    async def set_mute(self, muted: bool) -> dict:
+        """Mute or unmute output, restoring the previous volume on unmute.
+
+        Deliberately not persisted. A stored mute would boot the robot silent
+        with nothing on screen to explain it.
+        """
+        target = 0 if muted else self._percent_to_index(self._volume)
+        for control in self.VOLUME_CONTROLS:
+            await self._set_control(control, str(target))
+        self._muted = bool(muted)
+        return {"muted": self._muted, "volume": self._volume}
+
+    async def set_mic_mute(self, muted: bool) -> dict:
+        """Disconnect or reconnect the microphone in hardware."""
+        value = "off" if muted else "on"
+        applied = [c for c in self.MIC_SWITCHES
+                   if await self._set_control(c, value)]
+        self._mic_muted = bool(muted)
+        return {"mic_muted": self._mic_muted, "controls": applied}
+
+    def _persist_audio_state(self) -> None:
+        if self._state is None or not self._state.available:
+            return
+        # Volume only. Mute is session state by design.
+        self._state.write(self.AUDIO_STATE_KEY, {"volume": self._volume})
+
+    async def _restore_audio_state(self) -> None:
+        if self._state is None or not self._state.available:
+            return
+        stored = self._state.read(self.AUDIO_STATE_KEY)
+        volume = stored.get("volume")
+        if isinstance(volume, int) and 0 <= volume <= 100:
+            await self.set_volume(volume)
+            log.info("output volume restored to %d%%", volume)
 
     MIXER_STATE_KEY = "mixer"
 

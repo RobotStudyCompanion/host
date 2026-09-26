@@ -335,3 +335,19 @@ class AudioBackend(Backend):
     async def mixer_reset(self) -> dict:
         """Discard stored changes and return to the shipped preset."""
         raise self._unsupported("mixer persistence")
+
+    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
+        """Set output volume, 0..100."""
+        raise self._unsupported("volume control")
+
+    async def get_volume(self) -> dict:
+        """Current volume and mute state."""
+        raise self._unsupported("volume control")
+
+    async def set_mute(self, muted: bool) -> dict:
+        """Mute or unmute output, preserving the volume setting."""
+        raise self._unsupported("volume control")
+
+    async def set_mic_mute(self, muted: bool) -> dict:
+        """Disconnect or reconnect the microphone."""
+        raise self._unsupported("microphone mute")
