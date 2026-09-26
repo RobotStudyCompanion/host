@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from rsc_host.config import AudioSettings, RingSettings, SerialSettings, ServoSettings
 from rsc_host.errors import PeripheralUnavailableError
+from rsc_host.state import StateStore
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
 from rsc_host.hal.base import (
@@ -158,6 +159,7 @@ def _build_backends(
     servo: ServoSettings,
     ring: RingSettings,
     serial: SerialSettings,
+    state: StateStore | None = None,
 ) -> tuple[
     ServoBackend, RingBackend, GpioInputBackend, GpioPwmBackend,
     SerialBackend, AudioBackend,
@@ -179,7 +181,7 @@ def _build_backends(
             FakeGpioInput(),
             FakeGpioPwm(),
             FakeSerial(),
-            FakeAudio(),
+            FakeAudio(state=state),
         )
 
     if backend != "pi":
@@ -266,6 +268,7 @@ def _build_backends(
             capture=capture,
             mixer_card=audio.mixer_card,
             apply_mixer_preset=audio.apply_mixer_preset,
+            state=state,
         ),
     )
 
@@ -316,6 +319,18 @@ class _AudioSelftestArgs(BaseModel):
     seconds: float = Field(default=3.0, ge=0.5, le=30.0)
     playback: bool = True
     path: str = Field(default="/tmp/rsc_selftest.wav", max_length=512)
+    settle_ms: int = Field(
+        default=250,
+        ge=0,
+        le=2000,
+        description=(
+            "Audio discarded from the front of the capture. The ADC settles "
+            "over roughly the first quarter second and emits a transient far "
+            "above the speech that follows — left in, it lands as a clipped "
+            "peak and a click, and makes the peak reading meaningless. The "
+            "legacy test rig dropped the same 250 ms."
+        ),
+    )
 
 
 class _ServoCalibrationArgs(BaseModel):
@@ -369,10 +384,6 @@ class _MixerSetArgs(BaseModel):
     value: str = Field(max_length=64)
 
 
-class _MixerStoreArgs(BaseModel):
-    path: str = Field(default="/var/lib/alsa/asound.state", max_length=512)
-
-
 class _EmptyArgs(BaseModel):
     pass
 
@@ -390,6 +401,7 @@ async def setup(
     servo_settings: ServoSettings | None = None,
     ring_settings: RingSettings | None = None,
     serial_settings: SerialSettings | None = None,
+    state: StateStore | None = None,
 ) -> Peripherals:
     """Build backends + peripherals, register verbs, start everything.
 
@@ -407,6 +419,10 @@ async def setup(
     servo_cfg = servo_settings or ServoSettings()
     ring_cfg = ring_settings or RingSettings()
     serial_cfg = serial_settings or SerialSettings()
+    # Durable user settings. Constructed here rather than passed down from
+    # __main__ so the fake backend gets one too — a laptop dev session should
+    # exercise the same persistence path the robot uses.
+    store = state if state is not None else StateStore()
 
     if pinout is None:
         pinout = Pinout(
@@ -425,7 +441,7 @@ async def setup(
 
     # Backends
     servo_be, ring_be, gpio_in_be, gpio_pwm_be, serial_be, audio_be = _build_backends(
-        backend, pinout, audio_cfg, servo_cfg, ring_cfg, serial_cfg
+        backend, pinout, audio_cfg, servo_cfg, ring_cfg, serial_cfg, store
     )
     for be in (servo_be, ring_be, gpio_in_be, gpio_pwm_be, serial_be, audio_be):
         await be.start()
@@ -613,7 +629,10 @@ async def setup(
         queue = await audio.start_capture()
         chunks: list[bytes] = []
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + args.seconds
+        # Record the settling time on top of the requested duration, so the
+        # caller still gets the seconds they asked for after the trim.
+        settle_s = args.settle_ms / 1000.0
+        deadline = loop.time() + args.seconds + settle_s
         try:
             while True:
                 remaining = deadline - loop.time()
@@ -635,6 +654,14 @@ async def setup(
                 "capture produced no audio; check `arecord -l` and the mixer"
             )
 
+        # Trim the ADC settling transient. Computed in whole frames, so the
+        # offset always lands on a sample boundary — a byte-misaligned trim
+        # turns every sample after it into noise.
+        frame_bytes = width * channels
+        skip = int(rate * settle_s) * frame_bytes
+        if 0 < skip < len(pcm):
+            pcm = pcm[skip:]
+
         def _write_and_measure() -> dict:
             with wave.open(args.path, "wb") as w:
                 w.setnchannels(channels)
@@ -646,9 +673,16 @@ async def setup(
             def dbfs(v: float) -> float:
                 return round(20 * math.log10(v / 32768), 1) if v > 0 else -120.0
 
+            peak = dbfs(float(np.abs(xs).max()))
+            rms = dbfs(float(np.sqrt((xs**2).mean())))
             return {
-                "peak_dbfs": dbfs(float(np.abs(xs).max())),
-                "rms_dbfs": dbfs(float(np.sqrt((xs**2).mean()))),
+                "peak_dbfs": peak,
+                "rms_dbfs": rms,
+                # Speech runs 12–18 dB. Much higher means one spike dominates
+                # — a transient or a knock, not the voice — and the peak
+                # reading says nothing about the recording as a whole.
+                "crest_db": round(peak - rms, 1),
+                "clipped_samples": int((np.abs(xs) >= 32767).sum()),
             }
 
         levels = await asyncio.to_thread(_write_and_measure)
@@ -658,6 +692,7 @@ async def setup(
             "path": args.path,
             "bytes": len(pcm),
             "seconds": round(frames / rate, 3),
+            "settle_ms_discarded": args.settle_ms,
             "format": fmt,
             "played": False,
             **levels,
@@ -726,9 +761,15 @@ async def setup(
     async def _audio_mixer_preset(_args: _EmptyArgs) -> dict:
         return {"applied": await audio_be.mixer_apply_preset()}
 
-    @dispatcher.verb("audio.mixer.store", args_model=_MixerStoreArgs)
-    async def _audio_mixer_store(args: _MixerStoreArgs) -> dict:
-        return await audio_be.mixer_store(args.path)
+    @dispatcher.verb("audio.mixer.store", args_model=_EmptyArgs)
+    async def _audio_mixer_store(_args: _EmptyArgs) -> dict:
+        """Keep the mixer changes made since the daemon started."""
+        return await audio_be.mixer_store()
+
+    @dispatcher.verb("audio.mixer.reset", args_model=_EmptyArgs)
+    async def _audio_mixer_reset(_args: _EmptyArgs) -> dict:
+        """Discard stored changes and go back to the shipped preset."""
+        return await audio_be.mixer_reset()
 
     # ---- Status ----
 
@@ -765,6 +806,10 @@ async def setup(
                 "current_mode": ring.current_mode,
             },
             "button_led": {"mode": button_led.current_mode},
+            # Whether settings survive a restart, and where they live. Worth a
+            # place in the snapshot: a user whose stored tweak silently failed
+            # to persist has no other way to find out.
+            "state": _safe(store.status),
             "cyd": {"available": getattr(serial_be, "available", True)},
             "audio": {
                 "capturing": audio.is_capturing,
@@ -782,10 +827,11 @@ async def setup(
         }
 
     log.info(
-        "peripherals ready: backend=%s, servo_pins=%s, ring=%s, cyd_verbs=%d",
+        "peripherals ready: backend=%s, servo_pins=%s, ring=%s, state=%s, cyd_verbs=%d",
         backend,
         _servo_pins(pinout),
         ring_be.status(),
+        store.status(),
         len(curated_cyd_verbs()),
     )
 
