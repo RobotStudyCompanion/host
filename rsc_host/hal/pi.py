@@ -73,6 +73,7 @@ from rsc_host.hal.base import (
 )
 from rsc_host.hal.dsp import CaptureChain, CaptureConfig, ReferenceTap, to_reference
 from rsc_host.hal.types import Colour, Edge, GpioEdge
+from rsc_host.state import StateStore
 from rsc_host.ring_helper import (
     DEFAULT_SOCKET,
     OP_BRIGHTNESS,
@@ -981,6 +982,7 @@ class PiAudioBackend(AudioBackend):
         arecord_bin: str = "arecord",
         aplay_bin: str = "aplay",
         amixer_bin: str = "amixer",
+        state: StateStore | None = None,
     ) -> None:
         self._input_device = str(input_device)
         self._output_device = str(output_device)
@@ -990,6 +992,13 @@ class PiAudioBackend(AudioBackend):
         self._arecord = arecord_bin
         self._aplay = aplay_bin
         self._amixer_bin = amixer_bin
+        self._state = state
+        # Values the user set from the console, exactly as passed to `sset`.
+        # A snapshot via `sget` would not do: amixer reports display strings
+        # like "Capture 35 [56%] [9.00dB] [on]", which cannot be fed back in.
+        # Recording what was set keeps the overlay replayable by construction,
+        # and keeps it a record of *changes* rather than a full state dump.
+        self._user_mixer: dict[str, str] = {}
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._chain: CaptureChain | None = None
@@ -1020,6 +1029,10 @@ class PiAudioBackend(AudioBackend):
                 )
             except Exception:
                 log.exception("mixer preset failed; continuing with current state")
+        # The overlay goes on after the preset, so the shipped recipe is the
+        # floor and the user's room wins where it differs. A fresh robot has no
+        # overlay, so the preset stands alone and works untouched.
+        await self._apply_mixer_overlay()
         log.info(
             "PiAudioBackend started (in=%s, out=%s, %d Hz %d ch -> %d Hz mono)",
             self._input_device, self._output_device,
@@ -1398,10 +1411,22 @@ class PiAudioBackend(AudioBackend):
         return {"card": self._mixer_card, "controls": out}
 
     async def mixer_set(self, name: str, value: str) -> dict:
+        """Set one control, and remember the value for the overlay.
+
+        Held in memory only until :meth:`mixer_store` is called, so
+        experimenting costs nothing and a restart undoes it.
+        """
         rc, text = await self._amixer("sset", name, value)
         if rc != 0:
             raise ValueError(f"amixer rejected {name!r}={value!r}: {text.strip()}")
-        return {"control": name, "value": self._parse_amixer(text) or value}
+        self._user_mixer[name] = value
+        return {
+            "control": name,
+            "value": self._parse_amixer(text) or value,
+            "pending": True,
+            "stored": False,
+            "hint": "call audio.mixer.store to keep this across a restart",
+        }
 
     async def mixer_apply_preset(self) -> dict:
         """Apply the measured WM8960 state. Missing controls are skipped, not
@@ -1412,26 +1437,83 @@ class PiAudioBackend(AudioBackend):
             results[name] = "ok" if rc == 0 else "skipped"
         return results
 
-    async def mixer_store(self, path: str = "/var/lib/alsa/asound.state") -> dict:
-        """Persist the mixer state across reboots.
+    MIXER_STATE_KEY = "mixer"
 
-        Needs root, and needs ``alsa-restore`` to be unmasked — the ReSpeaker
-        installer masks it, which is why no setting survived a reboot before.
-        If the call fails, the returned hint is the command to run by hand.
-        """
-        hint = f"sudo alsactl store -f {path}"
-        if shutil.which("alsactl") is None:
-            return {"stored": False, "reason": "alsactl not found", "hint": hint}
-        proc = await asyncio.create_subprocess_exec(
-            "alsactl", "store", "-f", path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+    async def _apply_mixer_overlay(self) -> dict:
+        """Replay stored user changes over the shipped preset."""
+        if self._state is None or not self._state.available:
+            return {}
+        stored = self._state.read(self.MIXER_STATE_KEY)
+        if not stored:
+            return {}
+        applied: dict[str, str] = {}
+        for name, value in stored.items():
+            if not isinstance(value, str):
+                continue
+            rc, _ = await self._amixer("sset", name, value)
+            applied[name] = "ok" if rc == 0 else "skipped"
+            if rc == 0:
+                self._user_mixer[name] = value
+        log.info(
+            "mixer overlay applied (%d/%d controls from %s)",
+            sum(1 for v in applied.values() if v == "ok"),
+            len(applied),
+            self._state.path(self.MIXER_STATE_KEY),
         )
-        out, _ = await proc.communicate()
-        if proc.returncode == 0:
-            return {"stored": True, "path": path}
+        return applied
+
+    async def mixer_store(self) -> dict:
+        """Persist the user's mixer changes so they survive a restart.
+
+        Writes to the daemon's own state directory, not ALSA's
+        ``asound.state`` — that file is root-owned, and the console is the only
+        surface some users have. Persistence must not need a shell, nor a
+        privilege the daemon deliberately does not hold.
+
+        Only controls changed through :meth:`mixer_set` are written, so the
+        file records what differs from the shipped recipe rather than being a
+        full snapshot. That keeps it small, readable, and still correct when
+        the preset itself changes in a later release.
+        """
+        if self._state is None or not self._state.available:
+            reason = self._state.reason if self._state else "no state store"
+            return {
+                "stored": False,
+                "reason": f"no writable state directory ({reason})",
+                "fix": "add StateDirectory=rsc-host to the systemd unit",
+            }
+        if not self._user_mixer:
+            return {
+                "stored": False,
+                "reason": "nothing to store; no mixer control has been changed",
+                "hint": "set a control with audio.mixer.set first",
+            }
+        path = self._state.write(self.MIXER_STATE_KEY, dict(self._user_mixer))
+        log.info(
+            "mixer overlay stored (%d controls) -> %s", len(self._user_mixer), path
+        )
         return {
-            "stored": False,
-            "reason": out.decode("utf-8", "replace").strip(),
-            "hint": hint,
+            "stored": True,
+            "path": str(path),
+            "controls": dict(self._user_mixer),
+        }
+
+    async def mixer_reset(self) -> dict:
+        """Discard stored changes and return to the shipped preset.
+
+        The way back from a tuning session that went wrong, reachable from the
+        console without a shell.
+        """
+        removed = bool(
+            self._state
+            and self._state.available
+            and self._state.delete(self.MIXER_STATE_KEY)
+        )
+        self._user_mixer.clear()
+        applied = await self.mixer_apply_preset()
+        log.info("mixer reset to preset (overlay removed: %s)", removed)
+        return {
+            "reset": True,
+            "overlay_removed": removed,
+            "preset_controls": sum(1 for v in applied.values() if v == "ok"),
         }
