@@ -229,6 +229,8 @@ class PiServoBackend(ServoBackend):
         self._speeds: dict[str, float] = {}
         self._live: set[int] = set()  # pins with a wave started
         self._idle_tasks: dict[str, asyncio.Task[None]] = {}
+        # servo_id -> pulse width being held for calibration
+        self._held: dict[str, int] = {}
 
     # ---- Lifecycle ----
 
@@ -333,6 +335,63 @@ class PiServoBackend(ServoBackend):
             return
         self._cease(pin)
         log.debug("servo %s: pulses ceased (idle)", servo_id)
+
+
+    # ---- Calibration hold ----
+    #
+    # Finding a null needs the servo pulsed continuously at a candidate width
+    # so you can watch it for creep. Ordinary operation does the opposite: at
+    # speed zero the backend holds neutral briefly and then ceases pulses,
+    # because pulsing at neutral adds +17 dB above 8 kHz to the microphone.
+    #
+    # So calibration needs its own mode. A held servo is exempt from the idle
+    # cease and keeps its pulse until released or until a real speed command
+    # takes over.
+
+    async def hold_pulse(self, servo_id: str, us: int | None = None) -> dict:
+        """Pulse ``servo_id`` at ``us`` until released.
+
+        ``us`` defaults to the servo's current ``null_us``. The width is not
+        stored as calibration — this drives the hardware so the value can be
+        judged, and :meth:`set_calibration` is what commits it.
+        """
+        if self._chip is None:
+            raise PeripheralUnavailableError("PiServoBackend not started")
+        pin = self._pins.get(servo_id)
+        if pin is None:
+            raise KeyError(f"unknown servo_id: {servo_id!r}")
+        cal = self._cal.get(servo_id, ServoCalibration())
+        width = int(cal.null_us if us is None else us)
+        if not cal.min_us <= width <= cal.max_us:
+            raise CalibrationError(
+                f"{servo_id}: {width} µs outside the pulse window "
+                f"{cal.min_us}..{cal.max_us}"
+            )
+        self._cancel_idle(servo_id)
+        self._held[servo_id] = width
+        self._tx(pin, width)
+        return {
+            "id": servo_id,
+            "holding_us": width,
+            "null_us": cal.null_us,
+            "offset_us": width - cal.null_us,
+        }
+
+    async def release_hold(self, servo_id: str | None = None) -> dict:
+        """Stop holding, and cease pulses. Idempotent."""
+        targets = [servo_id] if servo_id else list(self._held)
+        released = []
+        for sid in targets:
+            if self._held.pop(sid, None) is None:
+                continue
+            pin = self._pins.get(sid)
+            if pin is not None:
+                self._cease(pin)
+            released.append(sid)
+        return {"released": released}
+
+    def holding(self) -> dict:
+        return dict(self._held)
 
     # ---- Calibration ----
 
@@ -455,6 +514,9 @@ class PiServoBackend(ServoBackend):
             raise KeyError(f"unknown servo_id: {servo_id!r}")
 
         self._cancel_idle(servo_id)
+        # A movement command ends any calibration hold on this servo: the
+        # operator has moved on, and leaving the hold would fight the command.
+        self._held.pop(servo_id, None)
 
         if abs(speed) < self._deadband:
             self._speeds[servo_id] = 0.0
@@ -478,8 +540,14 @@ class PiServoBackend(ServoBackend):
         return self._speeds.get(servo_id, 0.0)
 
     async def stop_all(self) -> None:
-        """Immediate stop: neutral, then cease pulses without the idle linger."""
+        """Immediate stop: neutral, then cease pulses without the idle linger.
+
+        Also drops any calibration hold. Stop must mean stop — a hold that
+        survived it would leave a servo driven after the operator asked for
+        silence.
+        """
         await self._cancel_all_idle()
+        self._held.clear()
         for servo_id, pin in self._pins.items():
             self._speeds[servo_id] = 0.0
             if pin in self._live:

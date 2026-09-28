@@ -234,32 +234,40 @@
     </p>
 
     <h2>Servo calibration</h2>
+    <div class="grid">
+        <button class="action" id="calTargetLeft">tune left</button>
+        <button class="action" id="calTargetRight">tune right</button>
+    </div>
     <div class="slider-row">
-        <label for="calNull">null &micro;s</label>
-        <input type="range" id="calNull" min="1400" max="1600" value="1500" step="1">
-        <output id="calNullOut">1500</output>
+        <label for="calNull">pulse &micro;s</label>
+        <input type="range" id="calNull" min="1400" max="1600" value="1500" step="1" disabled>
+        <output id="calNullOut">&mdash;</output>
     </div>
     <div class="grid">
-        <button class="action" id="calTargetLeft">tuning: left</button>
-        <button class="action" id="calTargetRight">tuning: right</button>
-        <button class="action wide" data-verb="servo.calibration">read calibration</button>
-        <button class="action wide" data-verb="servo.calibration.store">keep calibration</button>
-        <button class="action wide" data-verb="servo.calibration.reset">reset to shipped</button>
+        <button class="action wide" id="calAccept" disabled>this is the null &mdash; save it</button>
+        <button class="action wide" id="calRelease" disabled>release (stop pulsing)</button>
+        <button class="action" data-verb="servo.calibration">read values</button>
+        <button class="action" data-verb="servo.calibration.reset">reset to shipped</button>
     </div>
     <p class="hint">
-        <b>null &micro;s</b> is where the servo is genuinely still. Pick a side,
-        then drag until it stops creeping &mdash; changes apply live and are
-        forgotten on restart until you press <b>keep calibration</b>.
-        <b>span &micro;s</b> is a different quantity: the deflection meaning
-        full speed, and where a speed mismatch between the two physical servos
-        gets corrected. Set it from the custom box with
-        <code>servo.calibrate</code>.
+        Pick a side to start pulsing it at its stored null; the slider is dead
+        until you do, because a servo that is not being driven cannot be judged.
+        Then drag and watch that flipper arm: below the true null it creeps one
+        way, above it the other, and at the null it sits still. Land on the
+        middle of the still range, save, and release.
     </p>
     <p class="hint">
-        null_us is where the servo is genuinely still. span_us is the deflection
-        that means full speed, and is where a mismatch between two physical
-        servos gets corrected. Different quantities &mdash; changing one does
-        not imply the other. Adjust with servo.calibrate in the custom box.
+        Release when finished. A held servo keeps pulsing, and pulsing at
+        neutral is the single loudest thing on the microphone &mdash; about
+        17 dB above 8 kHz. Normal operation ceases pulses within 120 ms of
+        stopping for exactly that reason.
+    </p>
+    <p class="hint">
+        <b>span &micro;s</b> is a different quantity and is not set here: it is
+        the deflection meaning full speed, where a speed mismatch between the
+        two physical servos gets corrected. Judge it by driving both at the
+        same speed, then set it from the custom box with
+        <code>servo.calibrate</code>.
     </p>
 
     <h2>Ring</h2>
@@ -558,6 +566,7 @@ $("connectBtn").addEventListener("click", () => {
             if (msg.ok) {
                 log("ack", `← [${msg.id}] ok  ${JSON.stringify(msg.result ?? {})}`);
                 reportLevels(msg.result);
+                syncCalSlider(msg.result);
             } else {
                 log("err", `← [${msg.id}] ${msg.code}: ${msg.message}`);
             }
@@ -821,22 +830,45 @@ $("spdCentre").addEventListener("click", () => {
     send("flipper.stop_all", {});
 });
 
-// Calibration slider targets one servo at a time — null_us is per-servo, and
-// applying a value to both at once would undo the measurement you just made
-// on the other one.
-let calTarget = "left";
-function setCalTarget(id) {
+// ---- Calibration ----
+//
+// The slider drives servo.hold, not servo.calibrate. Setting null_us on a
+// stopped servo changes a number that will not be used until the next movement
+// command, and meanwhile nothing is pulsed and nothing moves — which is
+// exactly the dead-slider problem this replaces. servo.hold drives the pin at
+// the candidate width so the flipper can actually be watched.
+//
+// One servo at a time: null_us is per-servo, and holding both would make it
+// impossible to tell which arm is creeping.
+
+let calTarget = null;
+let calHeldUs = null;
+
+function setCalControlsEnabled(on) {
+    for (const id of ["calNull", "calAccept", "calRelease"]) {
+        $(id).disabled = !on;
+    }
+}
+
+const calSender = makeThrottledSender(120, (v) => {
+    calHeldUs = v;
+    if (calTarget) send("servo.hold", { id: calTarget, us: v });
+});
+
+async function startCalibration(id) {
     calTarget = id;
     $("calTargetLeft").style.borderColor = id === "left" ? "var(--accent)" : "";
     $("calTargetRight").style.borderColor = id === "right" ? "var(--accent)" : "";
-    log("info", `calibration slider now targets the ${id} servo`);
+    setCalControlsEnabled(true);
+    // Hold at the stored null first; the reply tells us where that is, so the
+    // slider starts from the current value rather than an arbitrary 1500.
+    send("servo.hold", { id });
+    log("info", `holding the ${id} servo — drag the slider and watch that arm`);
 }
-$("calTargetLeft").addEventListener("click", () => setCalTarget("left"));
-$("calTargetRight").addEventListener("click", () => setCalTarget("right"));
 
-const calSender = makeThrottledSender(150, (v) =>
-    send("servo.calibrate", { id: calTarget, null_us: v })
-);
+$("calTargetLeft").addEventListener("click", () => startCalibration("left"));
+$("calTargetRight").addEventListener("click", () => startCalibration("right"));
+
 $("calNull").addEventListener("input", () => {
     $("calNullOut").textContent = $("calNull").value;
     calSender.update(Number($("calNull").value));
@@ -844,7 +876,36 @@ $("calNull").addEventListener("input", () => {
 $("calNull").addEventListener("change", () => {
     calSender.commit(Number($("calNull").value));
 });
-setCalTarget("left");
+
+$("calAccept").addEventListener("click", () => {
+    if (!calTarget || calHeldUs === null) {
+        log("err", "nothing held — pick a side and move the slider first");
+        return;
+    }
+    // Commit the held width as the null, and persist in the same call. The
+    // operator has just watched it sit still; making them press a second
+    // button to keep that is a good way to lose the measurement.
+    send("servo.calibrate", { id: calTarget, null_us: calHeldUs, persist: true });
+});
+
+$("calRelease").addEventListener("click", () => {
+    send("servo.hold.stop", {});
+    calTarget = null;
+    calHeldUs = null;
+    setCalControlsEnabled(false);
+    $("calNullOut").textContent = "\u2014";
+    $("calTargetLeft").style.borderColor = "";
+    $("calTargetRight").style.borderColor = "";
+});
+
+// The hold reply carries the width actually being driven, so the slider can
+// follow the robot rather than the other way round.
+function syncCalSlider(result) {
+    if (!result || result.holding_us === undefined) return;
+    calHeldUs = result.holding_us;
+    $("calNull").value = result.holding_us;
+    $("calNullOut").textContent = result.holding_us;
+}
 
 // Initial state
 setStatus("disconnected", "disconnected");

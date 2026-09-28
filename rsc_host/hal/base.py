@@ -81,6 +81,14 @@ class ServoBackend(Backend):
             "calibration is not supported by this servo backend"
         )
 
+    async def hold_pulse(self, servo_id: str, us: int | None = None) -> dict:
+        """Pulse one servo at a fixed width until released, for calibration."""
+        raise self._unsupported("calibration hold")
+
+    async def release_hold(self, servo_id: str | None = None) -> dict:
+        """Stop holding. Idempotent."""
+        raise self._unsupported("calibration hold")
+
     def store_calibration(self) -> dict:
         """Persist measured calibration so it survives a restart."""
         raise self._unsupported("servo calibration persistence")

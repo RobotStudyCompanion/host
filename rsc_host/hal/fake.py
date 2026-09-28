@@ -58,6 +58,7 @@ class FakeServo(ServoBackend):
         self._state = state
         self._speeds: dict[str, float] = {}
         self._cal: dict[str, dict] = {}
+        self._held: dict[str, int] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -70,6 +71,10 @@ class FakeServo(ServoBackend):
         log.info("FakeServo stopped")
 
     async def set_speed(self, servo_id: str, speed: float) -> None:
+        # A movement command ends any calibration hold, matching the Pi
+        # backend — otherwise a laptop session behaves differently from the
+        # robot in exactly the place the behaviour matters.
+        self._held.pop(servo_id, None)
         self._speeds[servo_id] = speed
         log.debug("FakeServo[%s] speed=%.3f", servo_id, speed)
 
@@ -80,6 +85,25 @@ class FakeServo(ServoBackend):
         for servo_id in self._speeds:
             self._speeds[servo_id] = 0.0
         log.info("FakeServo stop_all (%d servos)", len(self._speeds))
+
+    async def hold_pulse(self, servo_id: str, us: int | None = None) -> dict:
+        cal = self._cal.get(servo_id, self._DEFAULT_CAL)
+        width = int(cal["null_us"] if us is None else us)
+        self._held[servo_id] = width
+        return {
+            "id": servo_id,
+            "holding_us": width,
+            "null_us": cal["null_us"],
+            "offset_us": width - cal["null_us"],
+        }
+
+    async def release_hold(self, servo_id: str | None = None) -> dict:
+        targets = [servo_id] if servo_id else list(self._held)
+        released = [sid for sid in targets if self._held.pop(sid, None) is not None]
+        return {"released": released}
+
+    def holding(self) -> dict:
+        return dict(self._held)
 
     SERVO_STATE_KEY = "servo"
 

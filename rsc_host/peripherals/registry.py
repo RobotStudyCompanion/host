@@ -346,6 +346,23 @@ class _ServoCalibrationArgs(BaseModel):
     id: str | None = None
 
 
+class _ServoHoldStopArgs(BaseModel):
+    id: str | None = None
+
+
+class _ServoHoldArgs(BaseModel):
+    """Pulse one servo at a fixed width so its behaviour can be watched.
+
+    This is the instrument the null measurement needs. Ordinary operation
+    ceases pulses when stopped, because pulsing at neutral is the loudest thing
+    on the microphone — so a stationary servo is normally not driven at all,
+    and there is nothing to observe.
+    """
+
+    id: str
+    us: int | None = Field(default=None, ge=500, le=2500)
+
+
 class _ServoCalibrateArgs(BaseModel):
     """Adjust one servo's calibration. Omitted fields are left alone.
 
@@ -594,6 +611,22 @@ async def setup(
     @dispatcher.verb("servo.calibration", args_model=_ServoCalibrationArgs)
     async def _servo_calibration(args: _ServoCalibrationArgs) -> dict:
         return {"calibration": servo_be.calibration(args.id)}
+
+    @dispatcher.verb("servo.hold", args_model=_ServoHoldArgs)
+    async def _servo_hold(args: _ServoHoldArgs) -> dict:
+        """Drive one servo at a fixed pulse width until released.
+
+        Defaults to the servo's stored null. Watch the flipper: below the true
+        null it creeps one way, above it the other, and at the null it is
+        still. Release when done — a held servo keeps pulsing, and pulsing at
+        neutral is what adds +17 dB above 8 kHz to the microphone.
+        """
+        return await servo_be.hold_pulse(args.id, args.us)
+
+    @dispatcher.verb("servo.hold.stop", args_model=_ServoHoldStopArgs)
+    async def _servo_hold_stop(args: _ServoHoldStopArgs) -> dict:
+        """Stop holding, and cease pulses. Omit ``id`` to release all."""
+        return await servo_be.release_hold(args.id)
 
     @dispatcher.verb("servo.calibration.store", args_model=_EmptyArgs)
     async def _servo_calibration_store(_args: _EmptyArgs) -> dict:
