@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from rsc_host.config import AudioSettings, RingSettings, SerialSettings, ServoSettings
 from rsc_host.errors import PeripheralUnavailableError
+from rsc_host import power
 from rsc_host.state import StateStore
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
@@ -346,6 +347,18 @@ class _ServoCalibrationArgs(BaseModel):
     id: str | None = None
 
 
+class _PowerArgs(BaseModel):
+    """Confirmation is explicit and has no default.
+
+    A caller that forgets it gets INVALID_ARGS rather than a powered-off robot,
+    which matters because these verbs are reachable from any client, not only
+    the console with its confirm dialog.
+    """
+
+    confirm: bool
+    delay_s: float = Field(default=2.0, ge=0.0, le=60.0)
+
+
 class _ServoHoldStopArgs(BaseModel):
     id: str | None = None
 
@@ -430,7 +443,10 @@ class _EmptyArgs(BaseModel):
 
 
 async def _cyd_control_loop(
-    bus: EventBus, audio_be: AudioBackend, cyd: CydBridge
+    bus: EventBus,
+    audio_be: AudioBackend,
+    cyd: CydBridge,
+    _power_from_panel,
 ) -> None:
     """Make the front-panel knob and buttons do something.
 
@@ -460,6 +476,15 @@ async def _cyd_control_loop(
         ),
         "host_mute": ("audio.mute", lambda _data: _toggle_mute(audio_be)),
         "host_mic": ("audio.mic_mute", lambda _data: _toggle_mic(audio_be)),
+        # The panel already asks the user to confirm before sending
+        # host_poweroff — it stashes the command and only emits it when YES is
+        # pressed. Demanding a second confirmation the panel has no way to
+        # give would make the button permanently dead.
+        "host_poweroff": (
+            "system.poweroff",
+            lambda _data: _power_from_panel("poweroff"),
+        ),
+        "host_reboot": ("system.reboot", lambda _data: _power_from_panel("reboot")),
     }
     async with bus.subscribe() as queue:
         while True:
@@ -488,6 +513,14 @@ async def _cyd_control_loop(
             await bus.publish(
                 Event(topic=topic, source="host", data=dict(result))
             )
+
+
+def _make_power_from_panel(prepare):
+    """Bind the panel's power requests to the same path the verbs use."""
+    async def _power_from_panel(action: str) -> dict:
+        await prepare(action)
+        return await power.request(action)
+    return _power_from_panel
 
 
 async def _toggle_mute(audio_be: AudioBackend) -> dict:
@@ -993,6 +1026,56 @@ async def setup(
     # Named peripherals.status, not status: __main__ owns the bare "status"
     # verb (version, verb list, subscriber count) and registering it twice
     # raises at boot.
+    # ---- Power ----
+
+    async def _prepare_for_power_change(action: str) -> None:
+        """Leave the hardware safe before the machine goes down.
+
+        systemd would stop the unit anyway, but only after logind has begun
+        the transition — and a servo that keeps pulsing through it is a servo
+        driving into an unpowered gearbox. Stopping first costs milliseconds.
+        """
+        async def _try(what: str, coro) -> None:
+            # Every step here is best-effort. A ring helper that already died
+            # must not stop the machine going down — the operator asked for
+            # shutdown, and refusing it because the lights would not turn off
+            # is the wrong answer.
+            try:
+                await coro
+            except Exception:
+                log.warning("pre-%s: %s failed", action, what, exc_info=True)
+
+        await _try("stop flippers", servo_be.stop_all())
+        await _try("release holds", servo_be.release_hold())
+        await _try("ring off", ring.set_mode("off"))
+        # Tell the panel something is happening. It has no other way to know,
+        # and a face still animating through a shutdown looks like a crash.
+        await _try("cyd notice", cyd.send_curated("cyd.mood", "SAD"))
+        await bus.publish(
+            Event(topic=f"system.{action}", source="host", data={"pending": True})
+        )
+
+    @dispatcher.verb("system.power_status", args_model=_EmptyArgs)
+    async def _system_power_status(_args: _EmptyArgs) -> dict:
+        """Whether the daemon may power the machine down, and why not if not."""
+        return await power.status()
+
+    @dispatcher.verb("system.poweroff", args_model=_PowerArgs)
+    async def _system_poweroff(args: _PowerArgs) -> dict:
+        """Shut the robot down. Requires ``confirm: true``."""
+        if not args.confirm:
+            raise ValueError("poweroff requires confirm:true")
+        await _prepare_for_power_change("poweroff")
+        return await power.request("poweroff", args.delay_s)
+
+    @dispatcher.verb("system.reboot", args_model=_PowerArgs)
+    async def _system_reboot(args: _PowerArgs) -> dict:
+        """Reboot the robot. Requires ``confirm: true``."""
+        if not args.confirm:
+            raise ValueError("reboot requires confirm:true")
+        await _prepare_for_power_change("reboot")
+        return await power.request("reboot", args.delay_s)
+
     @dispatcher.verb("peripherals.status", args_model=_EmptyArgs)
     async def _peripherals_status(_args: _EmptyArgs) -> dict:
         """One-shot snapshot of every peripheral.
@@ -1061,7 +1144,10 @@ async def setup(
     # Started here rather than by the caller: the loop is part of what makes
     # the peripherals work, and Peripherals.stop() owns its cancellation.
     control_task = asyncio.create_task(
-        _cyd_control_loop(bus, audio_be, cyd), name="cyd-control"
+        _cyd_control_loop(
+            bus, audio_be, cyd, _make_power_from_panel(_prepare_for_power_change)
+        ),
+        name="cyd-control",
     )
 
     return Peripherals(

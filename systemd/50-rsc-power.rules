@@ -1,0 +1,18 @@
+// Let the rsc-host daemon power the robot down without being root.
+//
+// logind already owns shutdown and reboot; polkit decides who may ask. By
+// default a service user gets "challenge" — interactive authentication, which
+// a process with no session cannot supply — so the daemon needs this grant.
+//
+// Two named actions for one user. A sudoers entry would instead whitelist a
+// command line, which is coarser and easier to get subtly wrong.
+//
+// Install to /etc/polkit-1/rules.d/50-rsc-power.rules, owned by root, 0644.
+
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.reboot") &&
+        subject.user == "rsc") {
+        return polkit.Result.YES;
+    }
+});
