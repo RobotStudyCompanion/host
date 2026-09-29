@@ -1,129 +1,99 @@
 # Pi-side setup
 
-One-time steps to bring the RSC Pi from a fresh Raspberry Pi OS install to a
-running `rsc-host` service on boot.
+One-time steps to bring an RSC Pi from a fresh Raspberry Pi OS install to a
+`rsc-host` service that starts on boot.
 
-Assumes: Raspberry Pi OS Bookworm (or newer), user `pi` (adapt the paths and
-service filename if you use a different username), the RSC Power/Peripheral
-HAT fitted, and a working audio HAT (ReSpeaker 2-Mic pHAT or Adafruit Voice
-Bonnet).
+Assumes Raspberry Pi OS Trixie or newer on a Pi 4, user `rsc`, the RSC
+Power/Peripheral HAT fitted, and a ReSpeaker 2-Mic HAT for audio.
 
-## 1. System prerequisites
+> **Do not install or enable pigpiod.** An earlier version of this document
+> told you to, and that was the cause of the timing problems that were once
+> blamed on the hardware. See [Why not pigpio](#why-not-pigpio) below. If
+> `pigpiod` is present on a machine you are fixing rather than building, mask
+> it: `sudo systemctl mask pigpiod`.
+
+## 1. System packages
 
 ```bash
 sudo apt update
 sudo apt install -y \
     python3-venv python3-pip \
-    pigpio python3-pigpio \
+    python3-lgpio \
     git \
-    libportaudio2 \
-    build-essential \
-    avahi-daemon
+    alsa-utils \
+    libasound2-plugins \
+    avahi-daemon \
+    raspi-utils
 ```
 
-Give the Pi a friendly name — this doubles as its network identity and its
-advertised name over mDNS.
+No `pigpio`. No `libportaudio2` — the daemon drives ALSA directly through
+`arecord` and `aplay` rather than through PortAudio, because PortAudio cannot
+address `plughw` and negotiates its own sample rate, which on this codec
+produces audible warble.
+
+`raspi-utils` provides `pinctrl`, which the service uses on shutdown to hold
+the arcade LED pin low.
+
+Give the Pi a name; it doubles as its mDNS identity:
 
 ```bash
-sudo hostnamectl set-hostname Shiny        # or Pinky, Minion, rsc-01, ...
+sudo hostnamectl set-hostname rsc-shiny
 sudo systemctl enable --now avahi-daemon
 ```
 
-After a reboot the Pi is reachable at `Shiny.local` from any machine on the
-LAN (Linux, macOS, Windows 10+). The daemon additionally advertises itself
-as ``_rsc-host._tcp.local`` for zero-config client discovery.
+## 2. UART for the CYD front panel
 
-## 2. Enable UART for the CYD front panel
+The panel needs `/dev/serial0` as a real UART with no console attached.
 
-The CYD dispatch link needs `/dev/serial0` as a full UART, without the
-console attached. Edit `/boot/firmware/config.txt`:
+In `/boot/firmware/config.txt`:
 
 ```ini
 enable_uart=1
 ```
 
-Then remove `console=serial0,115200` (or similar) from
-`/boot/firmware/cmdline.txt` if present. Reboot.
+Remove any `console=serial0,115200` from `/boot/firmware/cmdline.txt`. Reboot,
+then check `ls -l /dev/serial0` resolves.
 
-Verify:
-
-```bash
-ls -l /dev/serial0        # should exist and be a symlink
-```
-
-## 3. Enable pigpiod on boot
+## 3. Group membership
 
 ```bash
-sudo systemctl enable --now pigpiod
-sudo systemctl status pigpiod     # should be active (running)
+sudo usermod -aG gpio,spi,audio,dialout,i2c rsc
 ```
 
-## 4. Group membership
+Log out and back in. `gpio` covers both the chardev lines and the ring
+helper's socket; `audio` covers the WM8960.
 
-The service runs as the `pi` user, which needs access to GPIO, SPI, audio,
-serial, and I2C:
+## 4. ALSA
+
+The capture recipe was measured rather than guessed, and the daemon applies it
+at every start, so nothing here is strictly required. Two settings matter
+anyway:
 
 ```bash
-sudo usermod -aG gpio,spi,audio,dialout,i2c pi
+# Proper resampling, rather than ALSA's crude default
+sudo tee /etc/asound.conf > /dev/null <<'EOF'
+defaults.pcm.rate_converter "speexrate_medium"
+EOF
+
+# The ReSpeaker installer masks this; without it nothing survives a reboot
+sudo systemctl unmask alsa-restore
+sudo systemctl enable alsa-restore
 ```
 
-Log out and back in, or reboot, for the group membership to take effect.
+## 5. Get the code onto the Pi
 
-## 5. Get the code onto the Pi (Syncthing)
-
-Two options: **git clone** (simple, one-shot) or **Syncthing** (auto-updates
-as you edit on your laptop — worth setting up if you'll iterate).
-
-### Option A — git clone (one-shot)
+Either clone, or use Syncthing if you will be iterating from a laptop.
 
 ```bash
 cd ~
-git clone https://github.com/RobotStudyCompanion/host.git
+git clone https://github.com/RobotStudyCompanion/host.git rsc-host
 ```
 
-Skip to section 6.
-
-### Option B — Syncthing (auto-sync from laptop)
-
-Install and enable as a user service — runs under your login, not root, so
-synced files land with the right ownership.
-
-```bash
-sudo apt install -y syncthing
-sudo systemctl enable --now syncthing@$USER.service
-sudo systemctl status syncthing@$USER.service   # active (running)?
-```
-
-Syncthing binds its GUI to `127.0.0.1:8384` — safe, but unreachable from the
-laptop directly. Open a tunnel from the laptop:
-
-```bash
-# On the laptop, in a spare terminal — leave it running
-ssh -L 8384:127.0.0.1:8384 <your-pi-host>
-```
-
-Browse to `http://127.0.0.1:8384` on the laptop; you're now looking at the
-Pi's Syncthing GUI. It will prompt for an admin username/password on first
-load — set it.
-
-Pair the devices:
-
-* On the Pi's GUI: **Actions → Show ID.** Copy the device ID.
-* On the laptop (run Syncthing there too if you haven't): same, **Actions →
-  Show ID.**
-* On the Pi's GUI: **Add Remote Device**, paste the laptop's ID, save.
-* On the laptop's GUI: accept the incoming device prompt.
-
-Share the host/ folder:
-
-* On the laptop: **Add Folder.** Path = wherever `host/` lives locally,
-  label "host", share with the Pi.
-* On the Pi's GUI: accept the shared folder prompt, set path to `/home/$USER/host`.
-
-**Ignore patterns** — set on both sides (Folder → Edit → Ignore Patterns):
+With Syncthing, ignore these on both sides or the sync will fight you:
 
 ```
 .venv
+rsc-env
 __pycache__
 .pytest_cache
 .mypy_cache
@@ -132,179 +102,193 @@ __pycache__
 .stversions
 ```
 
-The Python virtualenv is platform-specific binaries — syncing it would break
-things. The others are caches; syncing them just wastes traffic.
-
-Within 30 s files appear in `/home/$USER/host` on the Pi.
-
-## 6. Install the host package
+**`__pycache__` is not optional.** Syncthing preserves source mtimes, and
+Python invalidates its bytecode cache on mtime plus size — so a freshly synced
+file can look older than its own `.pyc` and be silently ignored. If a change
+appears not to take effect, this is the first thing to check:
 
 ```bash
-cd ~/host
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[pi]"
+sudo find /home/rsc/rsc-host -name __pycache__ -type d -exec rm -rf {} +
+sudo systemctl restart rsc-host@rsc
 ```
+
+## 6. Python environment
+
+```bash
+python3 -m venv --system-site-packages ~/rsc-env
+~/rsc-env/bin/pip install pydantic websockets numpy
+```
+
+Optional, each failing soft if absent:
+
+```bash
+~/rsc-env/bin/pip install pyserial-asyncio   # CYD front panel
+~/rsc-env/bin/pip install zeroconf           # mDNS service advertisement
+~/rsc-env/bin/pip install scipy              # sharper high-pass filter
+```
+
+The ring helper additionally needs `rpi_ws281x` and
+`adafruit-circuitpython-neopixel`, installed in whichever interpreter runs it.
+
+**Only one virtualenv.** Do not also `pip install -e .` into a second one. A
+package installed into site-packages shadows the source tree, and the daemon
+will run the installed copy while you edit the other — which has already cost
+a debugging session on this project.
 
 Smoke test in the foreground:
 
 ```bash
-export RSC_HOST_TOKEN=dev
-export RSC_HOST_BACKEND=pi
-export RSC_HOST_BIND=0.0.0.0    # so LAN clients can reach it
-python -m rsc_host
+cd ~/rsc-host
+RSC_HOST_BACKEND=pi RSC_HOST_RING_MODE=off RSC_HOST_TOKEN=dev \
+  ~/rsc-env/bin/python -m rsc_host
 ```
 
-You should see:
+The line that matters is `gpiozero pin factory: LGPIOFactory`. If it says
+anything else, something has pulled in pigpio.
 
-```
-INFO rsc_host.hal.pi: PiServoBackend started (pins=...)
-INFO rsc_host.hal.pi: PiRingBackend started (pixels=16, buffer=16)
-INFO rsc_host.hal.pi: PiGpioInputBackend started (pins=(23,))
-INFO rsc_host.hal.pi: PiGpioPwmBackend started (pins=(24,))
-INFO rsc_host.hal.pi: PiSerialBackend started (device=/dev/serial0, baud=115200)
-INFO rsc_host.hal.pi: PiAudioBackend started (...)
-INFO rsc_host.peripherals.registry: peripherals ready: backend=pi, ...
-INFO rsc_host.server: host serving on ws://0.0.0.0:8765
-```
+## 7. systemd units
 
-Ctrl-C to stop. If any backend fails, the log will name the specific one —
-usually a pin conflict, missing group membership, or pigpiod not running.
-
-### Audio device selection
-
-By default the daemon uses the ALSA default input and output. To pin a
-specific device — useful when a USB mic and an audio HAT coexist, or the
-HAT itself needs override — list what's available:
+Two units. `rsc-ring.service` runs as root and owns the NeoPixel ring;
+`rsc-host@.service` runs as `rsc` and owns everything else.
 
 ```bash
-rsc-host-audio-check
+sudo cp ~/rsc-host/systemd/rsc-ring.service /etc/systemd/system/
+sudo cp ~/rsc-host/systemd/rsc-host@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rsc-ring.service
+sudo systemctl enable --now rsc-host@rsc.service
 ```
 
-Sample output:
-
-```
-Default input:  0
-Default output: 0
-
-idx  in   out  rate     name
-------------------------------------------------------------
-0    2*   2*   48000    seeed2micvoicec: - (hw:0,0)
-1    1    0    44100    USB PnP Sound Device: (hw:1,0)
-2    0    2    48000    HDMI 0: (hw:2,0)
-```
-
-The `*` marks the current default. To use device 1 for input and 2 for
-output, set the env vars (in the shell for a foreground run, or in the
-systemd unit for the service):
+Put the token in a drop-in rather than the unit, so reinstalling the unit does
+not regenerate it:
 
 ```bash
-export RSC_HOST_AUDIO_INPUT=1
-export RSC_HOST_AUDIO_OUTPUT=2
-export RSC_HOST_AUDIO_SAMPLERATE=16000
+sudo systemctl edit rsc-host@rsc.service
+# Environment=RSC_HOST_TOKEN=your-token-here
 ```
 
-Values can be integer indices or name substrings (e.g. ``USB PnP`` matches
-device 1 above).
+Neither unit may be `After=multi-user.target` — both are `WantedBy` it, and
+ordering against the same target is a cycle. systemd resolves cycles by
+deleting a job, and it will pick the one you wanted.
 
-Smoke-test a specific device before pointing the daemon at it:
+### Why the ring needs its own root unit
+
+The ring sits on GPIO 12, which is PWM0. Driving SKC6812 timing from PWM0 means
+feeding the peripheral by DMA, and that means mapping `/dev/mem`.
+`/dev/gpiomem` — the unprivileged path the button, LED and servos use — exposes
+only the GPIO register block. No group membership or udev rule avoids root
+here. Confining it to a 300-line helper behind a unix socket keeps the daemon
+itself unprivileged.
+
+## 8. Power control (optional)
+
+Lets the console and the CYD's power buttons shut the robot down. Without it
+those buttons report why they cannot act.
 
 ```bash
-rsc-host-audio-check --test-play 2                 # beep on output 2
-rsc-host-audio-check --test-record 1 --sec 3       # record 3s from input 1
+sudo tee /etc/polkit-1/rules.d/50-rsc-power.rules > /dev/null <<'EOF'
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.reboot") &&
+        subject.user == "rsc") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+sudo chmod 0644 /etc/polkit-1/rules.d/50-rsc-power.rules
+
+busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+  org.freedesktop.login1.Manager CanPowerOff     # expect: s "yes"
 ```
 
-## 7. Install the systemd unit
+**What this grants.** Anyone who can run code as `rsc` may power the machine
+down without a password — which includes anyone holding the bearer token on the
+LAN. Weigh that against what a token already permits: driving both flippers at
+full speed, playing audio, lighting the ring. A graceful shutdown is arguably
+the mildest of those, and it is gentler on the SD card than the plug-pulling it
+replaces. On a shared machine, or a Pi doing something else important, skip it.
 
-Use the bundled installer — handles capability grants, unit installation, and
-token setup in one go. Run from the repo root with your venv active:
-
-```bash
-source .venv/bin/activate
-./scripts/install-systemd.sh
-```
-
-The script will:
-
-* Grant `cap_sys_rawio` + `cap_dac_override` + `cap_sys_nice` to the venv's
-  Python (needed for NeoPixel `/dev/mem` access).
-* Install the unit template at `/etc/systemd/system/rsc-host@.service`.
-* Prompt for a bearer token (or generate one) and store it in a systemd
-  drop-in at `/etc/systemd/system/rsc-host@$USER.service.d/token.conf`
-  (chmod 600).
-* Enable and start `rsc-host@$USER.service`.
-* Print status and useful commands.
-
-Save the token somewhere safe — clients need it to connect.
-
-To edit config after install:
-
-```bash
-sudo systemctl edit rsc-host@$USER.service    # add extra Environment= lines
-sudo systemctl restart rsc-host@$USER.service
-```
-
-Common commands:
-
-```bash
-sudo systemctl status  rsc-host@$USER.service
-sudo systemctl restart rsc-host@$USER.service
-sudo systemctl stop    rsc-host@$USER.service
-journalctl -u rsc-host@$USER.service -f       # live logs
-```
-
-## 8. Reboot to confirm boot-order behaviour
+## 9. Confirm
 
 ```bash
 sudo reboot
 ```
 
-After the Pi comes back:
+Then:
 
 ```bash
-systemctl status pigpiod rsc-host@pi.service
+systemctl is-active rsc-ring rsc-host@rsc     # both: active
+journalctl -b | grep -i "ordering cycle"      # silent
+journalctl -u rsc-host@rsc -b | head -20
 ```
 
-Both should be active. `rsc-host` will have started *after* `pigpiod` per
-the `After=` and `Requires=` directives in the unit.
+The startup lines worth reading:
 
-## 9. Safe-restart behaviour
-
-* If `pigpiod` dies, systemd restarts it, then restarts `rsc-host` (because
-  it `Requires=` pigpiod). No manual intervention.
-* If `rsc-host` itself crashes, systemd restarts it after 2 s. Rate-limited
-  to 5 restarts per minute; if it fails harder than that, systemd gives up
-  and reports failed status.
-
-To force-stop or check failure state:
-
-```bash
-sudo systemctl stop rsc-host@pi.service
-sudo systemctl reset-failed rsc-host@pi.service    # after crash-loop
 ```
+gpiozero pin factory: LGPIOFactory
+state directory: /var/lib/rsc-host
+PiRingBackend using helper at /run/rsc/ring.sock
+WM8960 mixer preset applied (13/13 controls)
+peripherals ready: backend=pi, ...
+host serving on ws://0.0.0.0:8765
+```
+
+Then connect the web console and try a flipper, the ring, and
+`audio.selftest`. The arcade LED should stay dark after
+`sudo systemctl stop rsc-host@rsc`.
+
+## Why not pigpio
+
+A previous investigation concluded that the Pi could not drive the servos, the
+ring and I2S audio concurrently, and that an RP2350 co-processor was needed.
+That conclusion was wrong.
+
+The cause was `pigpiod` running from a malformed unit: a second `[Service]`
+block appended to the file, with `ExecStop=/bin/systemctl kill pigpiod` — which
+kills its own calling transaction, exits `255/EXCEPTION`, and leaves DMA
+channels and the PWM peripheral unrestored. Everything downstream inherited the
+wreckage.
+
+With pigpio masked and everything on lgpio, all peripherals run concurrently,
+first time. No co-processor is required.
+
+lgpio has two traps that pigpio did not:
+
+- `gpio_claim_output` must precede `tx_servo`. Omitting it is a **silent
+  no-op** — the call succeeds and nothing moves.
+- `tx_servo(chip, pin, 0)` raises `bad PWM micros` if no wave has ever started
+  on that pin, so ceasing pulses needs a guard.
+
+Both are handled in `rsc_host/hal/pi.py`, and `_ensure_gpiozero_factory()`
+refuses to start if it finds pigpio in charge.
 
 ## Troubleshooting
 
-**"cannot connect to pigpiod"** — `sudo systemctl status pigpiod`. If stopped,
-`sudo systemctl start pigpiod`. If disabled, step 3.
+**Changes appear not to take effect** — stale bytecode. See section 5.
 
-**Ring not lighting** — verify the wiring goes to J6 (M1_PWM header, BCM 12).
-If the strip lights partially, try a longer buffer:
-edit `PiRingBackend(pixel_count=16, buffer_size=24)` in
-`rsc_host/peripherals/registry.py`.
+**`No module named rsc_host`** — run from `~/rsc-host`, or check the unit's
+`WorkingDirectory`.
 
-**Servos twitching at startup** — the code parks each servo at 1500 µs neutral
-in `PiServoBackend.start()`. If your servos treat 1500 as slow-forward rather
-than stop, adjust `_SERVO_TIMINGS` and `_SERVO_STOP_US` in
-`rsc_host/hal/pi.py`.
+**Servos do nothing, but commands succeed** — the `gpio_claim_output` trap.
+Check for `PiServoBackend started (pins=...)` in the log.
 
-**Button LED stays dimly lit after shutdown** — gpiozero occasionally leaves
-the line floating. `PiGpioPwmBackend.stop()` runs `pinctrl set <pin> op dl`
-to force it low; verify `pinctrl` is installed (`which pinctrl`). If missing,
-`sudo apt install raspi-utils`.
+**Ring unavailable** — `systemctl status rsc-ring`, and confirm the socket
+exists: `ls -l /run/rsc/ring.sock` (root:gpio, 0660). Your user must be in
+`gpio`.
 
-**No `/dev/serial0`** — step 2 wasn't done or the reboot didn't happen.
+**Arcade LED lights on shutdown** — releasing a chardev line reverts the pin to
+input, floating Q1's gate. `ExecStopPost=` runs `pinctrl set 24 op dl`, which
+writes the pad registers directly and therefore sticks. Check `which pinctrl`.
+The durable fix is a hardware pull-down on the gate; nothing here survives
+SIGKILL.
 
-**Audio device not found** — `arecord -l` and `aplay -l` to list ALSA devices.
-If needed, set `RSC_HOST_...` env vars for input/output device index in a
-follow-up (audio verbs land in a later layer).
+**Audio is quiet or silent** — run `audio.selftest` from the console and read
+the levels rather than guessing. Speech at a normal distance lands near
+−30 dBFS RMS with peaks around −10. Below −60 means the mic is not hearing you,
+which is the mixer. `audio.mixer.reset` restores the measured recipe.
+
+**No LAN discovery** — `zeroconf` missing, or the network was not up when the
+daemon started. Clients can still connect by hostname; mDNS hostname
+resolution is independent of our service advertisement.
+
+**No `/dev/serial0`** — section 2 was skipped, or the reboot did not happen.
