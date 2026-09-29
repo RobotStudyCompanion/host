@@ -26,7 +26,7 @@ sudo apt install -y \
     raspi-utils
 ```
 
-No `pigpio`. No `libportaudio2` — the daemon drives ALSA directly through
+No `pigpio`. No `libportaudio2`: the daemon drives ALSA directly through
 `arecord` and `aplay` rather than through PortAudio, because PortAudio cannot
 address `plughw` and negotiates its own sample rate, which on this codec
 produces audible warble.
@@ -103,7 +103,7 @@ __pycache__
 ```
 
 **`__pycache__` is not optional.** Syncthing preserves source mtimes, and
-Python invalidates its bytecode cache on mtime plus size — so a freshly synced
+Python invalidates its bytecode cache on mtime plus size, so a freshly synced
 file can look older than its own `.pyc` and be silently ignored. If a change
 appears not to take effect, this is the first thing to check:
 
@@ -132,7 +132,7 @@ The ring helper additionally needs `rpi_ws281x` and
 
 **Only one virtualenv.** Do not also `pip install -e .` into a second one. A
 package installed into site-packages shadows the source tree, and the daemon
-will run the installed copy while you edit the other — which has already cost
+will run the installed copy while you edit the other, which has already cost
 a debugging session on this project.
 
 Smoke test in the foreground:
@@ -167,7 +167,7 @@ sudo systemctl edit rsc-host@rsc.service
 # Environment=RSC_HOST_TOKEN=your-token-here
 ```
 
-Neither unit may be `After=multi-user.target` — both are `WantedBy` it, and
+Neither unit may be `After=multi-user.target`: both are `WantedBy` it, and
 ordering against the same target is a cycle. systemd resolves cycles by
 deleting a job, and it will pick the one you wanted.
 
@@ -175,7 +175,7 @@ deleting a job, and it will pick the one you wanted.
 
 The ring sits on GPIO 12, which is PWM0. Driving SKC6812 timing from PWM0 means
 feeding the peripheral by DMA, and that means mapping `/dev/mem`.
-`/dev/gpiomem` — the unprivileged path the button, LED and servos use — exposes
+`/dev/gpiomem`: the unprivileged path the button, LED and servos use, exposes
 only the GPIO register block. No group membership or udev rule avoids root
 here. Confining it to a 300-line helper behind a unix socket keeps the daemon
 itself unprivileged.
@@ -202,7 +202,7 @@ busctl call org.freedesktop.login1 /org/freedesktop/login1 \
 ```
 
 **What this grants.** Anyone who can run code as `rsc` may power the machine
-down without a password — which includes anyone holding the bearer token on the
+down without a password, which includes anyone holding the bearer token on the
 LAN. Weigh that against what a token already permits: driving both flippers at
 full speed, playing audio, lighting the ring. A graceful shutdown is arguably
 the mildest of those, and it is gentler on the SD card than the plug-pulling it
@@ -244,7 +244,7 @@ ring and I2S audio concurrently, and that an RP2350 co-processor was needed.
 That conclusion was wrong.
 
 The cause was `pigpiod` running from a malformed unit: a second `[Service]`
-block appended to the file, with `ExecStop=/bin/systemctl kill pigpiod` — which
+block appended to the file, with `ExecStop=/bin/systemctl kill pigpiod`: which
 kills its own calling transaction, exits `255/EXCEPTION`, and leaves DMA
 channels and the PWM peripheral unrestored. Everything downstream inherited the
 wreckage.
@@ -255,7 +255,7 @@ first time. No co-processor is required.
 lgpio has two traps that pigpio did not:
 
 - `gpio_claim_output` must precede `tx_servo`. Omitting it is a **silent
-  no-op** — the call succeeds and nothing moves.
+  no-op**: the call succeeds and nothing moves.
 - `tx_servo(chip, pin, 0)` raises `bad PWM micros` if no wave has ever started
   on that pin, so ceasing pulses needs a guard.
 
@@ -264,31 +264,31 @@ refuses to start if it finds pigpio in charge.
 
 ## Troubleshooting
 
-**Changes appear not to take effect** — stale bytecode. See section 5.
+**Changes appear not to take effect**: stale bytecode. See section 5.
 
-**`No module named rsc_host`** — run from `~/rsc-host`, or check the unit's
+**`No module named rsc_host`**: run from `~/rsc-host`, or check the unit's
 `WorkingDirectory`.
 
-**Servos do nothing, but commands succeed** — the `gpio_claim_output` trap.
+**Servos do nothing, but commands succeed**: the `gpio_claim_output` trap.
 Check for `PiServoBackend started (pins=...)` in the log.
 
-**Ring unavailable** — `systemctl status rsc-ring`, and confirm the socket
+**Ring unavailable**: `systemctl status rsc-ring`, and confirm the socket
 exists: `ls -l /run/rsc/ring.sock` (root:gpio, 0660). Your user must be in
 `gpio`.
 
-**Arcade LED lights on shutdown** — releasing a chardev line reverts the pin to
+**Arcade LED lights on shutdown**: releasing a chardev line reverts the pin to
 input, floating Q1's gate. `ExecStopPost=` runs `pinctrl set 24 op dl`, which
 writes the pad registers directly and therefore sticks. Check `which pinctrl`.
 The durable fix is a hardware pull-down on the gate; nothing here survives
 SIGKILL.
 
-**Audio is quiet or silent** — run `audio.selftest` from the console and read
+**Audio is quiet or silent**: run `audio.selftest` from the console and read
 the levels rather than guessing. Speech at a normal distance lands near
 −30 dBFS RMS with peaks around −10. Below −60 means the mic is not hearing you,
 which is the mixer. `audio.mixer.reset` restores the measured recipe.
 
-**No LAN discovery** — `zeroconf` missing, or the network was not up when the
+**No LAN discovery**: `zeroconf` missing, or the network was not up when the
 daemon started. Clients can still connect by hostname; mDNS hostname
 resolution is independent of our service advertisement.
 
-**No `/dev/serial0`** — section 2 was skipped, or the reboot did not happen.
+**No `/dev/serial0`**: section 2 was skipped, or the reboot did not happen.

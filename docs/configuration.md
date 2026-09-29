@@ -10,9 +10,9 @@ configuration at all should work.
 
 Three places a setting can come from, in increasing precedence:
 
-1. **Code defaults** — ship in the image, known-good on first boot
-2. **`/var/lib/rsc-host/*.json`** — what a user changed from the console
-3. **Environment** — a developer override
+1. **Code defaults**: ship in the image, known-good on first boot
+2. **`/var/lib/rsc-host/*.json`**, what a user changed from the console
+3. **Environment**: a developer override
 
 A fresh robot has no state files, so layer 1 runs alone. The console writes
 layer 2 (`audio.mixer.store`, `servo.calibration.store`); resetting deletes it.
@@ -22,20 +22,20 @@ Layer 3 is for things a user has no business changing.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `RSC_HOST_TOKEN` | — | **Required.** Bearer token. No default, deliberately |
+| `RSC_HOST_TOKEN` |, | **Required.** Bearer token. No default, deliberately |
 | `RSC_HOST_BIND` | `127.0.0.1` | Set `0.0.0.0` on a robot, or nothing on the LAN can reach it |
 | `RSC_HOST_PORT` | `8765` | |
 | `RSC_HOST_BACKEND` | `fake` | `pi` on a robot |
 | `RSC_HOST_LOG_LEVEL` | `INFO` | |
 | `RSC_HOST_ADVERTISE` | `true` | mDNS service advertisement |
 | `RSC_HOST_ROBOT_NAME` | hostname | Advertised name |
-| `RSC_HOST_TLS_CERT` / `_TLS_KEY` | — | Both or neither |
+| `RSC_HOST_TLS_CERT` / `_TLS_KEY` |, | Both or neither |
 | `RSC_HOST_STATE_DIR` | from systemd | Overrides `StateDirectory=` |
 
 The daemon warns when `ADVERTISE` is on but `BIND` is loopback: mDNS would
 publish an address nothing can reach.
 
-## Audio — device
+## Audio, device
 
 Fixed at start; changing them needs the ALSA device reopened.
 
@@ -49,7 +49,7 @@ Fixed at start; changing them needs the ALSA device reopened.
 | `RSC_HOST_AUDIO_MIXER_CARD` | `0` | |
 | `RSC_HOST_AUDIO_APPLY_MIXER` | `true` | Apply the measured preset at start |
 
-## Audio — capture chain
+## Audio, capture chain
 
 All retunable at runtime via `audio.capture.tune`; these set the boot value.
 
@@ -67,19 +67,19 @@ All retunable at runtime via `audio.capture.tune`; these set the boot value.
 
 **On the stream rate.** 48000 means no resampling anywhere, at the cost of
 letting the DC-DC converter's aliased tones (above 6 kHz, spaced ~2250 Hz) sit
-in band — audible as a faint whine. 16000 removes them by discarding that band,
+in band, audible as a faint whine. 16000 removes them by discarding that band,
 and is what speech models expect, but the decimated path currently garbles.
 Unresolved; see the audio notes.
 
 Deprecated: `RSC_HOST_AUDIO_SAMPLERATE` sets the stream rate with a warning.
-`RSC_HOST_AUDIO_CHANNELS` is ignored — the chain always emits mono.
+`RSC_HOST_AUDIO_CHANNELS` is ignored; the chain always emits mono.
 
 ## Servos
 
 | Variable | Default | Notes |
 |---|---|---|
 | `RSC_HOST_SERVO_LEFT_NULL_US` | `1495` | Measured |
-| `RSC_HOST_SERVO_RIGHT_NULL_US` | `1510` | **Provisional** — two noisy runs gave 1505 and 1520 |
+| `RSC_HOST_SERVO_RIGHT_NULL_US` | `1510` | **Provisional**: two noisy runs gave 1505 and 1520 |
 | `RSC_HOST_SERVO_M3_NULL_US` | `1500` | |
 | `RSC_HOST_SERVO_LEFT_SPAN_US` | `100` | |
 | `RSC_HOST_SERVO_RIGHT_SPAN_US` | `205` | From `SERVO_R_TRIM=105`, **set by eye, never measured** |
@@ -92,7 +92,7 @@ Deprecated: `RSC_HOST_AUDIO_SAMPLERATE` sets the stream rate with a warning.
 | `RSC_HOST_GPIOCHIP` | `0` | |
 
 `IDLE_MS` is load-bearing. Pulsing at neutral adds roughly 17 dB above 8 kHz
-and 4–5 dB in the speech band to the microphone — the single worst interferer
+and 4–5 dB in the speech band to the microphone: the single worst interferer
 measured. Ceasing pulses when idle is what removes it.
 
 Calibration set from the console lands in `/var/lib/rsc-host/servo.json` and
@@ -104,7 +104,7 @@ wins over these.
 |---|---|---|
 | `RSC_HOST_RING_MODE` | `auto` | `auto`, `helper`, `direct`, `off` |
 | `RSC_HOST_RING_SOCKET` | `/run/rsc/ring.sock` | |
-| `RSC_HOST_RING_GPIO` | `12` | PWM0. **Not 21** — that is PCM and would kill I2S audio |
+| `RSC_HOST_RING_GPIO` | `12` | PWM0. **Not 21**: that is PCM and would kill I2S audio |
 | `RSC_HOST_RING_PIXELS` | `16` | |
 | `RSC_HOST_RING_BRIGHTNESS` | `0.3` | |
 | `RSC_HOST_RING_WHITE_MODE` | `extract` | SKC6812 is RGBW |

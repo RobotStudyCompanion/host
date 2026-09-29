@@ -27,7 +27,7 @@ case E_ELEM_IMAGEBTN_VOLUME:
 
 The panel flips its own flag and tells the host to toggle. It never learns what
 the host actually did, and the host never learns the panel's flag exists. Note
-this contradicts the README, which states the CYD does not track mute state —
+this contradicts the README, which states the CYD does not track mute state -
 it does, in two static booleans.
 
 Three ways that goes wrong:
@@ -47,7 +47,7 @@ Three ways that goes wrong:
 | Persona | Reach | Can they detect a disagreement? |
 |---|---|---|
 | **Researcher** | Panel, console | Only by ear. No way to tell which surface is lying |
-| **Developer** | Both, plus SSH and `amixer` | Yes — `amixer sget Speaker` settles it |
+| **Developer** | Both, plus SSH and `amixer` | Yes, `amixer sget Speaker` settles it |
 | **Maintainer** | All of the above, plus firmware | Yes |
 
 The uniform-column test does not fire here: the developer and maintainer can
@@ -79,7 +79,7 @@ authority" is option 3 with the panel allowed to write first.
 **Option 4 deserves more than dismissal.** One surface is better than two
 disagreeing ones, and it needs no firmware change. It fails because the console
 is the *only* surface for a remote researcher, and because the console is where
-tuning happens — removing its audio controls to fix an icon would be the tail
+tuning happens, removing its audio controls to fix an icon would be the tail
 wagging the dog.
 
 **Option 2 is wrong** for a reason worth recording: the panel cannot be
@@ -92,7 +92,7 @@ it pushes after every change from either surface.
 One consequence to accept honestly: the panel can change under someone's hand.
 A researcher watching the icon flip because a colleague acted remotely will
 find that surprising. The alternative is an icon that is quietly wrong, which
-is worse — surprise is recoverable, silent inconsistency is not.
+is worse, surprise is recoverable, silent inconsistency is not.
 
 ---
 
@@ -106,8 +106,8 @@ enables pushing only on the latter, so the same daemon works before and after
 the firmware lands with nothing to configure and nothing to remember. A panel
 that does not answer at all times out and is treated as unable.
 
-**The push.** After every volume, mute or mic change — from the console *or*
-from the panel — the host sends the resulting state. Pushing after a
+**The push.** After every volume, mute or mic change, from the console *or*
+from the panel, the host sends the resulting state. Pushing after a
 panel-originated press is the important half: that is when the panel's own flag
 may have diverged.
 
@@ -121,7 +121,7 @@ startup and visible in `peripherals.status` as `cyd.state_push`.
 
 Three commands, one bug fix. All in the existing dispatch-table pattern.
 
-### 1. `vol:NN` — set slider position without emitting
+### 1. `vol:NN`: set slider position without emitting
 
 ```cpp
 static void cmdSetVol(const String &val) {
@@ -138,8 +138,8 @@ static void cmdGetVol() { Serial.printf("vol:            %d\n", _volumeLevel); }
 
 **Critical:** this must not emit `host_vol`. If `gslc_ElemXSliderSetPos` fires
 `CbSlidePos`, host and panel will chase each other around a loop. Either the
-GUIslice call does not invoke the callback on a programmatic set — verify, do
-not assume — or guard it:
+GUIslice call does not invoke the callback on a programmatic set, verify, do
+not assume, or guard it:
 
 ```cpp
 static bool _suppressVolEmit = false;
@@ -150,7 +150,7 @@ if (_suppressVolEmit) { _volumeLevel = v; refreshVolumeIcon(); break; }
 The getter is what the host probes for, so it must exist even if nothing else
 reads it.
 
-### 2. `mute:on|off` and `mic:on|off` — set state, not toggle
+### 2. `mute:on|off` and `mic:on|off`: set state, not toggle
 
 ```cpp
 static void cmdSetMute(const String &val) {
@@ -174,7 +174,7 @@ Absolute, not toggling. The host sends what it decided; the panel does not
 interpret.
 
 These need `_muted`, `_micMuted`, `_volumeLevel` and `refreshVolumeIcon()`
-reachable from `Config.cpp` — currently `static` in `MenuCallbacks.cpp`. Either
+reachable from `Config.cpp`: currently `static` in `MenuCallbacks.cpp`. Either
 move the setters into that file and declare them in its header, or drop the
 `static`.
 
@@ -203,8 +203,8 @@ if (millis() - _lastVolSendMs >= 100) {
 ```
 
 Leading-edge throttle with no trailing send. Drag from 50 to 80 and release
-90 ms after the last emission, and the host never hears 80 — it stays at
-whatever the last throttled sample was. The slider shows 80, the robot sits at
+90 ms after the last emission, and the host never hears 80. It stays at
+whatever the last throttled sample was. The slider shows 80 while the robot sits at
 52, and nothing visibly went wrong.
 
 The brightness slider has the same shape but is harmless: `setBacklight()` runs
@@ -227,7 +227,7 @@ void serviceVolumeFlush() {
 }
 ```
 
-Once `vol:NN` exists, the host's push after a drag also corrects it — but only
+Once `vol:NN` exists, the host's push after a drag also corrects it, though only but only
 to the value the host received, which is the wrong one. The flush is the real
 fix; the push cannot substitute for it.
 
@@ -251,7 +251,7 @@ from the mixer case.
 
 **The asymmetry test, not the uniform-column test.** Every option was
 diagnosable by a developer and opaque to a researcher. No column was uniform,
-so the earlier signature never fired — but the *gap between columns* was the
+so the earlier signature never fired, but the *gap between columns* was the
 whole problem. A bug that one persona can trivially check and another cannot is
 a bug that will survive testing, because the people testing are the ones who
 can check.
@@ -265,5 +265,5 @@ designed around instead of fixed.
 **Capability probing beats a configuration flag.** A flag needs somebody to
 remember to flip it after flashing. Asking the firmware what it supports means
 the correct behaviour happens on its own, which matters when the person
-flashing and the person configuring are not the same person — or, in the
+flashing and the person configuring are not the same person, or, in the
 researcher case, not a person who configures anything at all.

@@ -7,7 +7,7 @@ Restart the daemon after copying, reload the console page.
 
 RMS −30.4 with peak −0.1 is a 30 dB crest factor. Speech runs 12–18 dB. A
 single spike that far above everything else is the ADC settling transient at
-the start of capture, not the recording being too loud — which is exactly why
+the start of capture, not the recording being too loud, which is exactly why
 the legacy test rig discarded the first quarter second:
 
 ```python
@@ -27,7 +27,7 @@ alone, and a note when crest is above 24 dB, meaning one spike still dominates.
 
 The earlier measurements found aliased DC-DC converter tones above 6 kHz,
 spaced roughly 2250 Hz, recorded as unfixable digitally because the aliasing
-has already happened before the ADC — but removed by downsampling to 16 kHz.
+has already happened before the ADC, but removed by downsampling to 16 kHz.
 
 At 48 kHz on the wire those tones are fully in band, so you hear them. Nothing
 in the capture chain can remove them; only the low-pass ahead of decimation
@@ -62,5 +62,5 @@ written to /tmp/rsc_selftest.wav (286080 bytes, 2.98s)
 ```
 
 Crest in the teens and no clipping line. If the peak is still at the rail with
-a high crest after the trim, the spike is something else — a knock on the
-chassis, or a genuine transient — and lowering `Capture` is the next move.
+a high crest after the trim, then the spike is something else: a knock on the
+chassis, or a genuine transient, and lowering `Capture` is the next move.
