@@ -58,6 +58,31 @@
     header .status.disconnected { background: rgba(255, 128, 128, 0.15); color: var(--err); }
     header .status.connected    { background: rgba(126, 212, 145, 0.15); color: var(--ok); }
     header .status.connecting   { background: rgba(255, 178, 102, 0.15); color: var(--warn); }
+    header .ready {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-family: var(--mono);
+        font-size: 12px;
+        background: var(--panel);
+        color: var(--fg-dim);
+        cursor: default;
+    }
+    header .ready .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--fg-dim);
+        flex: none;
+    }
+    header .ready.live    .dot { background: var(--ok); }
+    header .ready.live         { color: var(--ok); }
+    header .ready.degraded .dot { background: var(--warn); }
+    header .ready.degraded      { color: var(--warn); }
+    header .ready.simulated .dot { background: var(--accent); }
+    header .ready.simulated      { color: var(--accent); }
     .controls {
         grid-area: controls;
         padding: 16px 20px;
@@ -189,6 +214,7 @@
     <button id="connectBtn">Connect</button>
     <button id="scanBtn" title="Try to reach common RSC hostnames on the LAN">Scan</button>
     <button id="disconnectBtn" disabled>Disconnect</button>
+    <span id="ready" class="ready" title="peripheral readiness"><span class="dot"></span><span id="readyText">unknown</span></span>
     <span id="status" class="status disconnected">disconnected</span>
 </header>
 
@@ -409,6 +435,10 @@
 <script>
 let ws = null;
 let cmdCounter = 0;
+// Which verb each outstanding command id belongs to. The ack carries only the
+// id, and some replies need to be handled by verb — re-asking for readiness
+// after a ring command, for instance.
+const inflight = new Map();
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -475,6 +505,7 @@ function send(verb, args) {
     }
     const id = "c" + (++cmdCounter);
     const msg = { type: "cmd", id, verb, args: args || {} };
+    inflight.set(id, verb);
     ws.send(JSON.stringify(msg));
     log("sent", `→ ${verb}  ${JSON.stringify(args || {})}`);
 
@@ -552,6 +583,7 @@ $("connectBtn").addEventListener("click", () => {
         log("info", `connected (subprotocol: ${ws.protocol})`);
         saveKnownRobot(host);
         saveTokenFor(host, token);
+        refreshReadiness();
     };
 
     ws.onmessage = (evt) => {
@@ -563,13 +595,26 @@ $("connectBtn").addEventListener("click", () => {
             return;
         }
         if (msg.type === "ack") {
+            if (msg.id === "readiness") {
+                if (msg.ok) renderReadiness(msg.result);
+                else {
+                    $("ready").className = "ready degraded";
+                    $("readyText").textContent = "status failed";
+                }
+                return;
+            }
             if (msg.ok) {
                 log("ack", `← [${msg.id}] ok  ${JSON.stringify(msg.result ?? {})}`);
                 reportLevels(msg.result);
                 syncCalSlider(msg.result);
+                // Ring and state availability can change under us — a helper
+                // restart, a full disk. Cheap to re-ask after a ring command.
+                const verb = inflight.get(msg.id);
+                if (verb && verb.startsWith("ring.")) refreshReadiness();
             } else {
                 log("err", `← [${msg.id}] ${msg.code}: ${msg.message}`);
             }
+            inflight.delete(msg.id);
         } else if (msg.type === "event") {
             const seq = msg.seq != null ? `#${msg.seq} ` : "";
             log("event", `⇢ ${seq}${msg.source}:${msg.topic}  ${JSON.stringify(msg.data)}`);
@@ -584,6 +629,7 @@ $("connectBtn").addEventListener("click", () => {
 
     ws.onclose = (evt) => {
         setStatus("disconnected", "disconnected");
+        renderReadiness(null);
         log("info", `closed (code=${evt.code}, reason=${evt.reason || "-"})`);
         ws = null;
     };
@@ -756,6 +802,64 @@ $("historyBtn").addEventListener("click", () => {
     send("events.history", { limit: 20 });
 });
 
+
+
+// ---- Readiness ----
+//
+// "Connected" and "working" are different claims. A daemon on the fake backend
+// answers every verb cheerfully and moves nothing; a real one with the ring
+// helper down looks identical until you ask for a colour. The badge separates
+// the two so the question "is this robot actually doing anything" has an
+// answer on screen rather than in somebody's head.
+//
+// Read from peripherals.status, which the daemon already reports — no special
+// endpoint, and it stays honest because it is the same snapshot used for
+// diagnosis.
+
+function renderReadiness(st) {
+    const badge = $("ready");
+    const text = $("readyText");
+    if (!st || typeof st !== "object") {
+        badge.className = "ready";
+        text.textContent = "unknown";
+        badge.title = "peripheral readiness — no status yet";
+        return;
+    }
+
+    const simulated = st.backend === "fake";
+    const ringOk = !!(st.ring && st.ring.available);
+    const cydOk = !!(st.cyd && st.cyd.available);
+    const stateOk = !!(st.state && st.state.available);
+
+    // Missing pieces are listed rather than summarised: "degraded" alone sends
+    // you hunting, and the whole point is to save that hunt.
+    const missing = [];
+    if (!ringOk) missing.push("ring");
+    if (!cydOk) missing.push("cyd");
+    if (!stateOk) missing.push("no saved settings");
+
+    if (simulated) {
+        badge.className = "ready simulated";
+        text.textContent = "simulated";
+        badge.title = "backend=fake — every verb answers, no hardware moves";
+    } else if (missing.length === 0) {
+        badge.className = "ready live";
+        text.textContent = "ready";
+        badge.title = "backend=pi, ring, cyd and saved settings all available";
+    } else {
+        badge.className = "ready degraded";
+        text.textContent = missing.join(", ");
+        badge.title = `backend=pi, unavailable: ${missing.join(", ")}`;
+    }
+}
+
+function refreshReadiness() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Sent with a reserved id so the reply can be recognised and consumed
+    // without printing a status blob nobody asked for on every connect.
+    const id = "readiness";
+    ws.send(JSON.stringify({ type: "cmd", id, verb: "peripherals.status", args: {} }));
+}
 
 // ---- Sliders ----
 //
