@@ -19,7 +19,7 @@ from websockets.exceptions import InvalidStatus
 from rsc_host.auth import TokenAuth
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
-from rsc_host.motion import FLIPPER, HOLD, Owner, Part, current_owner
+from rsc_host.motion import MotionOwners
 from rsc_host.peripherals.registry import setup
 from rsc_host.protocol import Ack, Cmd, Event
 from rsc_host.server import (
@@ -54,7 +54,7 @@ async def running_server() -> AsyncIterator[tuple[Server, Dispatcher, EventBus, 
     async def _echo(args: _EchoArgs) -> dict:
         return {"echoed": args.message}
 
-    server = Server(dispatcher, bus, auth, bind="127.0.0.1", port=0)
+    server = Server(dispatcher, bus, auth, motion=MotionOwners(), bind="127.0.0.1", port=0)
     await server.start()
     # Discover the ephemeral port the OS actually gave us.
     port = server._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
@@ -390,11 +390,12 @@ class TestOwnerCloses:
         await _call(owner, "servo.hold", id="right", us=1500)
         await owner.close()
         await _settled()
-        assert robot.peripherals.motion.parts(FLIPPER) == []
-        assert robot.peripherals.motion.parts(HOLD) == []
+        assert robot.peripherals.motion.owned() == {}
 
 
 class TestOwnershipRules:
+    """One end-to-end check per verb. The rules themselves are in test_motion.py."""
+
     @pytest.mark.parametrize(
         ("verb", "args"),
         [
@@ -409,7 +410,7 @@ class TestOwnershipRules:
         try:
             await _call(a, "flipper.left", speed=0.5)
             assert (await _call(b, verb, **args)).ok
-            assert robot.peripherals.motion.owner_of(Part(FLIPPER, "left")) is None
+            assert robot.peripherals.motion.owned() == {}
             # Nothing left for A to stop, so closing must publish nothing at all.
             seq = robot.bus.latest_seq()
             await a.close()
@@ -426,47 +427,13 @@ class TestOwnershipRules:
             await _call(a, "servo.hold", id="left", us=1500)
             released = await _call(b, "servo.hold.stop", **args)
             assert released.result == {"released": ["left"]}
-            assert robot.peripherals.motion.parts(HOLD) == []
+            assert robot.peripherals.motion.owned() == {}
             await _call(b, "servo.hold", id="left", us=1500)
             await a.close()
             await _settled()
             assert "left" in robot.servo.holding()
         finally:
             await b.close()
-
-    async def test_hold_stop_without_id_clears_every_owner(self, robot) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        try:
-            await _call(a, "servo.hold", id="left", us=1500)
-            await _call(b, "servo.hold", id="right", us=1500)
-            await _call(b, "servo.hold.stop")
-            assert robot.peripherals.motion.parts(HOLD) == []
-        finally:
-            await a.close()
-            await b.close()
-
-    async def test_takeover_moves_responsibility(self, robot) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "flipper.left", speed=0.5)
-        await _call(b, "flipper.left", speed=0.6)
-        await a.close()
-        await _settled()
-        assert robot.speed() == 0.6
-        await b.close()
-        await _until(lambda: robot.speed() == 0.0)
-
-    async def test_hold_takeover_moves_responsibility(self, robot) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "servo.hold", id="left", us=1500)
-        await _call(b, "servo.hold", id="left", us=1510)
-        await a.close()
-        await _settled()
-        assert robot.servo.holding() == {"left": 1510}
-        await b.close()
-        await _until(lambda: not robot.servo.holding())
 
     async def test_watcher_closing_changes_nothing(self, robot) -> None:
         owner = await robot.connect()
@@ -483,31 +450,6 @@ class TestOwnershipRules:
         finally:
             await owner.close()
 
-    async def test_stopping_something_owns_nothing(self, robot) -> None:
-        # A's only act is a stop; closing afterwards must not touch B's flipper.
-        a = await robot.connect()
-        b = await robot.connect()
-        try:
-            await _call(a, "flipper.left.stop")
-            await _call(b, "flipper.left", speed=0.5)
-            await a.close()
-            await _settled()
-            assert robot.speed() == 0.5
-        finally:
-            await b.close()
-
-    async def test_speed_command_takes_a_held_servo_from_its_holder(self, robot) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "servo.hold", id="left", us=1500)
-        await _call(b, "flipper.left", speed=0.5)
-        assert robot.peripherals.motion.parts(HOLD) == []
-        await a.close()
-        await _settled()
-        assert robot.speed() == 0.5
-        await b.close()
-        await _until(lambda: robot.speed() == 0.0)
-
     async def test_hold_takes_a_turning_flipper_from_its_owner(self, robot) -> None:
         # The hold replaces the flipper's pulses. A closing must not end B's hold,
         # and when B closes nothing may be left running.
@@ -520,62 +462,6 @@ class TestOwnershipRules:
         assert "left" in robot.servo.holding()
         await b.close()
         await _until(lambda: not robot.servo.holding() and robot.speed() == 0.0)
-
-    async def test_rejected_command_claims_nothing(self, robot) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "flipper.left", speed=0.5)
-        rejected = await _call(b, "flipper.left", speed=5.0)
-        assert rejected.code == "INVALID_ARGS"
-        await b.close()
-        await _settled()
-        assert robot.speed() == 0.5
-        await a.close()
-        await _until(lambda: robot.speed() == 0.0)
-
-    async def test_failed_start_restores_the_previous_owner(self, robot, monkeypatch) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "flipper.left", speed=0.5)
-
-        async def broken(*_args, **_kwargs):
-            raise ValueError("no such pulse")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(robot.peripherals.flipper_left, "set_speed", broken)
-            assert (await _call(b, "flipper.left", speed=0.6)).code == "INVALID_ARGS"
-        await b.close()
-        await _settled()
-        assert robot.speed() == 0.5
-        await a.close()
-        await _until(lambda: robot.speed() == 0.0)
-
-    async def test_failed_hold_claims_nothing(self, robot, monkeypatch) -> None:
-        owner = await robot.connect()
-
-        async def broken(*_args, **_kwargs):
-            raise KeyError("unknown servo_id: 'x'")
-
-        monkeypatch.setattr(robot.servo, "hold_pulse", broken)
-        assert (await _call(owner, "servo.hold", id="x")).code == "INVALID_ARGS"
-        assert robot.peripherals.motion.parts(HOLD) == []
-        await owner.close()
-
-    async def test_failed_stop_keeps_the_owner(self, robot, monkeypatch) -> None:
-        a = await robot.connect()
-        b = await robot.connect()
-        await _call(a, "flipper.left", speed=0.5)
-
-        async def broken():
-            raise ValueError("servo line gone")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(robot.peripherals.flipper_left, "stop", broken)
-            assert not (await _call(b, "flipper.left.stop")).ok
-        await b.close()
-        await a.close()
-        await _until(lambda: robot.speed() == 0.0)
-
 
 class TestCleanupIsRobust:
     async def test_one_failure_does_not_stop_the_others(self, robot, monkeypatch, caplog) -> None:
@@ -602,14 +488,14 @@ class TestCleanupIsRobust:
         await owner.send(
             json.dumps({"type": "cmd", "id": "x", "verb": "flipper.left", "args": {"speed": 0.5}})
         )
-        await _until(lambda: robot.peripherals.motion.parts(FLIPPER) != [])
+        await _until(lambda: robot.peripherals.motion.owned() != {})
         owner.transport.abort()
         await asyncio.sleep(0.05)
         flipper._lock.release()
         await _settled()
         assert robot.speed() == 0.0
         assert await robot.servo.get_speed("left") == 0.0
-        assert robot.peripherals.motion.parts(FLIPPER) == []
+        assert robot.peripherals.motion.owned() == {}
 
     async def test_slow_command_does_not_delay_the_stop(self, robot) -> None:
         # One command at a time per socket, so a long verb blocks the receive
@@ -652,7 +538,7 @@ class TestCleanupIsRobust:
         await _settled()
         await _settled()
         assert robot.speed() == 0.0
-        assert robot.peripherals.motion.parts(FLIPPER) == []
+        assert robot.peripherals.motion.owned() == {}
 
     async def test_command_slow_to_cancel_does_not_delay_the_stop(self, robot) -> None:
         finished = asyncio.Event()
@@ -696,61 +582,7 @@ class TestCleanupIsRobust:
         await asyncio.wait_for(moved.wait(), timeout=2.0)
         await owner.close()
         await _until(lambda: robot.speed() == 0.0)
-        assert robot.peripherals.motion.parts(FLIPPER) == []
-
-    async def test_cancelled_claim_stands_and_cancelled_release_is_undone(self, robot) -> None:
-        # Either way the part may be moving, so someone has to stay responsible.
-        motion = robot.peripherals.motion
-        claimed, released = Part(FLIPPER, "left"), Part(FLIPPER, "right")
-        owner = Owner("owner")
-        current_owner.set(owner)
-        with motion.claiming(released):
-            pass
-        current_owner.set(None)
-        entered = asyncio.Event()
-
-        async def claims() -> None:
-            current_owner.set(owner)
-            with motion.claiming(claimed):
-                entered.set()
-                await asyncio.sleep(60)
-
-        async def releases() -> None:
-            with motion.releasing(released):
-                entered.set()
-                await asyncio.sleep(60)
-
-        for body in (claims, releases):
-            entered.clear()
-            task = asyncio.create_task(body())
-            await entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        assert motion.owner_of(claimed) is owner
-        assert motion.owner_of(released) is owner
-
-    async def test_part_taken_over_during_cleanup_is_left_alone(self, robot) -> None:
-        # The stop tasks start a tick after the list of parts is built. A takeover
-        # landing in that gap must win.
-        motion = robot.peripherals.motion
-        part = Part(FLIPPER, "left")
-        first, second = Owner("first"), Owner("second")
-
-        async def takeover() -> None:
-            current_owner.set(second)
-            with motion.claiming(part):
-                pass
-
-        current_owner.set(first)
-        with motion.claiming(part):
-            await robot.peripherals.flipper_left.set_speed(0.5)
-        current_owner.set(None)
-        stopping = asyncio.create_task(motion.stop_owned(first, robot.dispatcher))
-        taking = asyncio.create_task(takeover())
-        await asyncio.gather(stopping, taking)
-        assert robot.speed() == 0.5
-        assert motion.owner_of(part) is second
+        assert robot.peripherals.motion.owned() == {}
 
     async def test_cancelled_connection_task(self, robot) -> None:
         stub = _StubConnection()

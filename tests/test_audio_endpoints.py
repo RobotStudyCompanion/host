@@ -16,6 +16,7 @@ from rsc_host.auth import TokenAuth
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
 from rsc_host.hal.fake import FakeAudio
+from rsc_host.motion import MotionOwners
 from rsc_host.peripherals.audio import Audio
 from rsc_host.server import Server
 
@@ -32,7 +33,7 @@ async def rig() -> AsyncIterator[tuple[Server, Audio, FakeAudio, int]]:
     auth = TokenAuth(TOKEN)
     audio = Audio(backend, bus)
 
-    server = Server(dispatcher, bus, auth, bind="127.0.0.1", port=0)
+    server = Server(dispatcher, bus, auth, motion=MotionOwners(), bind="127.0.0.1", port=0)
     server.add_path_handler("/audio/out", build_audio_out_handler(audio))
     server.add_path_handler("/audio/in", build_audio_in_handler(audio))
     await server.start()
@@ -101,7 +102,7 @@ class TestUploadFasterThanPlayback:
         bus = EventBus()
         audio = Audio(backend, bus)
         server = Server(
-            Dispatcher(), bus, TokenAuth(TOKEN), bind="127.0.0.1", port=0,
+            Dispatcher(), bus, TokenAuth(TOKEN), motion=MotionOwners(), bind="127.0.0.1", port=0,
             ping_interval=0.2, ping_timeout=0.2, close_timeout=0.2,
         )
         self.closes: list[int | None] = []

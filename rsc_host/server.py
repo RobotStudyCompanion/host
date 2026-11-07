@@ -83,10 +83,10 @@ class Server:
         bus: EventBus,
         auth: TokenAuth,
         *,
+        motion: MotionOwners,
         bind: str = "127.0.0.1",
         port: int = 8765,
         ssl_context: ssl.SSLContext | None = None,
-        motion: MotionOwners | None = None,
         ping_interval: float = PING_INTERVAL_S,
         ping_timeout: float = PING_TIMEOUT_S,
         close_timeout: float = CLOSE_TIMEOUT_S,
@@ -97,7 +97,9 @@ class Server:
         self._bind = bind
         self._port = port
         self._ssl = ssl_context
-        self._motion = motion if motion is not None else MotionOwners()
+        # Required: it must be the table the verb handlers record into, or
+        # closing a connection would stop nothing.
+        self._motion = motion
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._close_timeout = close_timeout

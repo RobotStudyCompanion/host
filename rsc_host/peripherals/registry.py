@@ -36,7 +36,7 @@ from rsc_host import power
 from rsc_host.state import StateStore
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
-from rsc_host.motion import FLIPPER, HOLD, MotionOwners, Part
+from rsc_host.motion import MotionOwners
 from rsc_host.protocol import Event
 from rsc_host.hal.base import (
     AudioBackend,
@@ -618,13 +618,8 @@ async def setup(
     # Who answers for each moving part, so it stops when they disconnect.
     motion = MotionOwners()
 
-    def _holds_ended_by(flipper: Flipper) -> tuple[Part, ...]:
-        # Any speed reaching the backend ends a hold on that servo. A disabled
-        # flipper never reaches it.
-        return (Part(HOLD, flipper.id),) if flipper.enabled else ()
-
     async def _stop_flipper(flipper: Flipper) -> None:
-        with motion.releasing(Part(FLIPPER, flipper.id), *_holds_ended_by(flipper)):
+        with motion.flipper_stopped(flipper):
             await flipper.stop()
 
     # ---- Verb registration ----
@@ -632,14 +627,8 @@ async def setup(
     def register_flipper(name: str, flipper: Flipper) -> None:
         @dispatcher.verb(f"flipper.{name}", args_model=_FlipperArgs)
         async def _handler(args: _FlipperArgs) -> dict:
-            part = Part(FLIPPER, name)
-            if args.speed == 0:
-                # A ramp down to zero is a stop too: it ends by itself.
-                with motion.releasing(part, *_holds_ended_by(flipper)):
-                    await flipper.set_speed(args.speed, ramp_ms=args.ramp_ms)
-            else:
-                with motion.claiming(part), motion.releasing(*_holds_ended_by(flipper)):
-                    await flipper.set_speed(args.speed, ramp_ms=args.ramp_ms)
+            with motion.speed_set(flipper, args.speed):
+                await flipper.set_speed(args.speed, ramp_ms=args.ramp_ms)
             return {
                 "id": flipper.id,
                 "speed": args.speed,
@@ -675,20 +664,13 @@ async def setup(
         still. Release when done — a held servo keeps pulsing, and pulsing at
         neutral is what adds +17 dB above 8 kHz to the microphone.
         """
-        # A hold takes the servo away from whoever was turning its flipper, so
-        # the holder answers for both. Otherwise the earlier owner closing would
-        # stop the flipper, and that stop would end this hold too.
-        parts = [Part(HOLD, args.id)]
-        if motion.owner_of(Part(FLIPPER, args.id)) is not None:
-            parts.append(Part(FLIPPER, args.id))
-        with motion.claiming(*parts):
+        with motion.hold_started(args.id):
             return await servo_be.hold_pulse(args.id, args.us)
 
     @dispatcher.verb("servo.hold.stop", args_model=_ServoHoldStopArgs)
     async def _servo_hold_stop(args: _ServoHoldStopArgs) -> dict:
         """Stop holding, and cease pulses. Omit ``id`` to release all."""
-        parts = [Part(HOLD, args.id)] if args.id else motion.parts(HOLD)
-        with motion.releasing(*parts):
+        with motion.hold_stopped(args.id):
             return await servo_be.release_hold(args.id)
 
     @dispatcher.verb("servo.calibration.store", args_model=_EmptyArgs)
