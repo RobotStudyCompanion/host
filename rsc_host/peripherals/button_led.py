@@ -22,11 +22,13 @@ from typing import Any
 
 from rsc_host.events import EventBus
 from rsc_host.hal.base import GpioPwmBackend
+from rsc_host.peripherals.params import check_duty, check_period_ms
 from rsc_host.protocol import Event
 
 log = logging.getLogger(__name__)
 
 _FRAME_PERIOD = 0.03  # ~33 Hz — smooth enough, gentle on the loop.
+_MODES = ("off", "on", "pulse", "breathe")
 
 
 class ButtonLed:
@@ -50,7 +52,20 @@ class ButtonLed:
         return self._current_mode
 
     async def set_mode(self, mode: str, params: dict[str, Any] | None = None) -> None:
+        """Switch to ``mode``.
+
+        Raises ``KeyError`` for an unknown mode and ``ValueError`` for bad
+        params, both before anything changes, so the running pattern survives.
+        """
+        if mode not in _MODES:
+            raise KeyError(
+                f"unknown button LED mode: {mode!r}; "
+                f"known: off, on, pulse, breathe"
+            )
         params = params or {}
+        check_duty(params)
+        check_period_ms(params)
+
         async with self._lock:
             await self._cancel_task()
             self._current_mode = mode
@@ -60,23 +75,16 @@ class ButtonLed:
                 duty = 0.0
             elif mode == "on":
                 duty = float(params.get("duty", 1.0))
-                if not 0.0 <= duty <= 1.0:
-                    raise ValueError(f"duty must be in [0.0, 1.0], got {duty!r}")
                 await self._backend.set_duty(self._pin, duty)
             elif mode == "pulse":
                 duty = 0.0
                 self._task = asyncio.create_task(
                     self._pulse(params), name=f"button-led-pulse"
                 )
-            elif mode == "breathe":
+            else:
                 duty = 0.0
                 self._task = asyncio.create_task(
                     self._breathe(params), name=f"button-led-breathe"
-                )
-            else:
-                raise KeyError(
-                    f"unknown button LED mode: {mode!r}; "
-                    f"known: off, on, pulse, breathe"
                 )
 
         await self._bus.publish(

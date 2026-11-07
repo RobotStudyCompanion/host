@@ -239,8 +239,16 @@ when a later release improves it.
 | `ring.modes` |, | `{"modes": [...]}` |
 | `ring.status` |, | Availability, socket, pixel count, brightness |
 
-Modes: `off`, `solid`, `pulse`, `spin`, `sweep`. Params: `r`, `g`, `b` (0–255)
-and `period_ms`.
+Modes: `off`, `solid`, `pulse`, `spin`, `sweep`.
+
+| Param | Limits | If omitted |
+|---|---|---|
+| `r`, `g`, `b` | Each a number, 0–255 | The mode's default colour |
+| `rgb` | A list of exactly three numbers, each 0–255. Wins over `r`, `g`, `b` | As above |
+| `period_ms` | A number, 50–60000 | `pulse` 1500, `spin` and `sweep` 1000 |
+
+Giving only some of `r`, `g`, `b` uses the default colour, but whichever are
+given must still be valid. See [param validation](#param-validation).
 
 Returns `PERIPHERAL_UNAVAILABLE` when the root helper is not running.
 
@@ -251,6 +259,22 @@ Returns `PERIPHERAL_UNAVAILABLE` when the root helper is not running.
 | `button_led` | `{"mode", "params"?: {"duty"?, "period_ms"?}}` | `{"mode"}` |
 
 Modes: `off`, `on`, `pulse`, `breathe`.
+
+| Param | Limits | If omitted |
+|---|---|---|
+| `duty` | A number, 0.0–1.0. Used by `on` | 1.0 |
+| `period_ms` | A number, 50–60000. Used by `pulse` and `breathe` | `pulse` 2000, `breathe` 3000 |
+
+### Param validation
+
+Ring and button LED params are checked before anything changes. An unknown mode
+or a bad value gets `INVALID_ARGS`, and the pattern already running carries on
+with its mode, params and events untouched.
+
+Strings (including numeric ones such as `"800"`), booleans, `null`, NaN and
+infinity are rejected. A field is checked whenever it is present, even in a mode
+that doesn't use it, so `{"mode": "solid", "params": {"period_ms": 0}}` is an
+error. Fields not listed here are ignored.
 
 ### CYD front panel
 

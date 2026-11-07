@@ -37,6 +37,7 @@ from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.events import EventBus
 from rsc_host.hal.base import RingBackend
 from rsc_host.hal.types import Colour
+from rsc_host.peripherals.params import check_colour, check_period_ms
 from rsc_host.protocol import Event
 
 log = logging.getLogger(__name__)
@@ -185,21 +186,24 @@ class Ring:
     async def set_mode(self, mode: str, params: dict[str, Any] | None = None) -> None:
         """Switch to ``mode``.
 
-        Raises ``KeyError`` for an unknown mode, and
-        :class:`~rsc_host.errors.PeripheralUnavailableError` when the ring has
-        no privileged path to the hardware — better an explicit failure than a
-        success Ack for pixels nobody will ever see.
+        Raises ``KeyError`` for an unknown mode, ``ValueError`` for bad params,
+        and :class:`~rsc_host.errors.PeripheralUnavailableError` when the ring
+        has no privileged path to the hardware — better an explicit failure
+        than a success Ack for pixels nobody will ever see. All of these leave
+        the running mode untouched.
         """
         if mode not in _modes:
             raise KeyError(
                 f"unknown ring mode: {mode!r}; known: {registered_modes()}"
             )
+        params = params or {}
+        check_period_ms(params)
+        check_colour(params)
         if not self._backend.available:
             status = self._backend.status()
             raise PeripheralUnavailableError(
                 f"ring is not available: {status.get('reason') or 'unknown reason'}"
             )
-        params = params or {}
         async with self._lock:
             await self._cancel_task()
             self._current_mode = mode
