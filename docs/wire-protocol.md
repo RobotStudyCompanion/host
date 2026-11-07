@@ -15,6 +15,23 @@ Three WebSocket paths on one port (default `8765`):
 
 All three require authentication.
 
+## Keepalive
+
+The daemon pings every connection every 5 s and gives up after 5 s without a
+pong, plus up to 2 s waiting for the close to complete. A peer that vanishes
+without closing (Wi-Fi lost, laptop asleep) is therefore noticed within about
+12 s. Browsers answer pings on their own. A script has to keep its event loop
+running: one that blocks for more than about 5 s gets disconnected, and anything
+it left moving stops. See [disconnecting](#disconnecting-stops-motion).
+
+The same happens if a client gets too far ahead on the control channel. Commands
+run one at a time per socket, and the daemon buffers 32 frames behind a running
+command before it stops reading, at which point pongs go unread. A client stays
+connected as long as `rate × (command seconds − 5)` is at most 32, which allows
+10 Hz through an 8 s command. Don't stream commands at a socket that is waiting
+on a long one: send them after its ack, or on a second socket. Every buffered
+command runs, in order, as soon as the long one ends.
+
 ## Authentication
 
 Bearer token via subprotocol negotiation:
@@ -149,6 +166,43 @@ the backend is never touched. Its pin collides with the ring.
 
 Speed is normalised, not pulse width. The mapping to microseconds comes from
 calibration, below.
+
+`flipper.<id>` acks as soon as the speed is applied or the ramp has started; a
+ramp carries on in the background and reports through `flipper.<id>.state`.
+
+### Disconnecting stops motion
+
+Flippers and servo holds stop when the control connection that started them
+goes away, however it ended: a clean close, a crash, or a lost network, which
+takes up to about 12 s to notice ([keepalive](#keepalive)). There is no opt-out.
+**A one-shot client that starts a flipper and exits stops it straight away**, so
+stay connected for as long as the motion should last.
+
+Tracked per flipper and per servo:
+
+| Command | Effect on ownership |
+|---|---|
+| `flipper.<id>` with non-zero speed | This connection now owns that flipper, taking it over from any earlier owner |
+| `servo.hold` | This connection now owns the hold on that servo, and also that servo's flipper if another connection owned it, because the hold has replaced its pulses |
+| `flipper.<id>` with speed 0, `flipper.<id>.stop`, `flipper.stop_all` | Clears ownership of the flipper and any hold on that servo, whichever connection sends it |
+| `servo.hold.stop` | Clears ownership of that hold, or of every hold when `id` is omitted, whichever connection sends it |
+
+A later speed command on a held servo ends the hold, so the hold's owner stops
+answering for it.
+
+When an owner closes, the daemon stops only what that connection still owns.
+A connection that owns nothing, such as one that only watches events, changes
+nothing by closing. The stop runs as an ordinary command, so other clients see
+the usual `flipper.<id>.state` event. Holds publish no event, on disconnect or
+otherwise.
+
+Stop commands may arrive on any connection, so a client can keep a second socket
+for them. A command still running on the closed connection is cancelled, and
+anything it had started is stopped too. A ramp to speed 0 counts as a stop: it
+is not interrupted by a disconnect and runs to the end, up to `ramp_ms`.
+
+Only motion is covered. Ring and button LED patterns, audio and the CYD keep
+their state when a client leaves.
 
 ### Servo calibration
 
