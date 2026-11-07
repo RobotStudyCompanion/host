@@ -36,6 +36,7 @@ from rsc_host import power
 from rsc_host.state import StateStore
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
+from rsc_host.motion import MotionOwners
 from rsc_host.protocol import Event
 from rsc_host.hal.base import (
     AudioBackend,
@@ -100,6 +101,7 @@ class Peripherals:
     button_led: ButtonLed
     cyd: CydBridge
     audio: Audio
+    motion: MotionOwners
     cyd_control_task: asyncio.Task | None = None
 
     async def stop(self) -> None:
@@ -613,12 +615,20 @@ async def setup(
         "m3": flipper_m3,
     }
 
+    # Who answers for each moving part, so it stops when they disconnect.
+    motion = MotionOwners()
+
+    async def _stop_flipper(flipper: Flipper) -> None:
+        with motion.flipper_stopped(flipper):
+            await flipper.stop()
+
     # ---- Verb registration ----
 
     def register_flipper(name: str, flipper: Flipper) -> None:
         @dispatcher.verb(f"flipper.{name}", args_model=_FlipperArgs)
         async def _handler(args: _FlipperArgs) -> dict:
-            await flipper.set_speed(args.speed, ramp_ms=args.ramp_ms)
+            with motion.speed_set(flipper, args.speed):
+                await flipper.set_speed(args.speed, ramp_ms=args.ramp_ms)
             return {
                 "id": flipper.id,
                 "speed": args.speed,
@@ -627,7 +637,7 @@ async def setup(
 
         @dispatcher.verb(f"flipper.{name}.stop", args_model=_FlipperStopArgs)
         async def _stop_handler(_args: _FlipperStopArgs) -> dict:
-            await flipper.stop()
+            await _stop_flipper(flipper)
             return {"id": flipper.id, "speed": 0.0}
 
     for _name, _flipper in flippers.items():
@@ -636,7 +646,7 @@ async def setup(
     @dispatcher.verb("flipper.stop_all", args_model=_EmptyArgs)
     async def _flipper_stop_all(_args: _EmptyArgs) -> dict:
         """Stop every flipper at once — the verb a panicking client wants."""
-        await asyncio.gather(*(f.stop() for f in flippers.values()))
+        await asyncio.gather(*(_stop_flipper(f) for f in flippers.values()))
         return {"stopped": sorted(flippers)}
 
     # ---- Servo calibration ----
@@ -654,12 +664,14 @@ async def setup(
         still. Release when done — a held servo keeps pulsing, and pulsing at
         neutral is what adds +17 dB above 8 kHz to the microphone.
         """
-        return await servo_be.hold_pulse(args.id, args.us)
+        with motion.hold_started(args.id):
+            return await servo_be.hold_pulse(args.id, args.us)
 
     @dispatcher.verb("servo.hold.stop", args_model=_ServoHoldStopArgs)
     async def _servo_hold_stop(args: _ServoHoldStopArgs) -> dict:
         """Stop holding, and cease pulses. Omit ``id`` to release all."""
-        return await servo_be.release_hold(args.id)
+        with motion.hold_stopped(args.id):
+            return await servo_be.release_hold(args.id)
 
     @dispatcher.verb("servo.calibration.store", args_model=_EmptyArgs)
     async def _servo_calibration_store(_args: _EmptyArgs) -> dict:
@@ -1165,5 +1177,6 @@ async def setup(
         button_led=button_led,
         cyd=cyd,
         audio=audio,
+        motion=motion,
         cyd_control_task=control_task,
     )

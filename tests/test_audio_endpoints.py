@@ -16,6 +16,7 @@ from rsc_host.auth import TokenAuth
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
 from rsc_host.hal.fake import FakeAudio
+from rsc_host.motion import MotionOwners
 from rsc_host.peripherals.audio import Audio
 from rsc_host.server import Server
 
@@ -32,7 +33,7 @@ async def rig() -> AsyncIterator[tuple[Server, Audio, FakeAudio, int]]:
     auth = TokenAuth(TOKEN)
     audio = Audio(backend, bus)
 
-    server = Server(dispatcher, bus, auth, bind="127.0.0.1", port=0)
+    server = Server(dispatcher, bus, auth, motion=MotionOwners(), bind="127.0.0.1", port=0)
     server.add_path_handler("/audio/out", build_audio_out_handler(audio))
     server.add_path_handler("/audio/in", build_audio_in_handler(audio))
     await server.start()
@@ -73,6 +74,99 @@ def _make_wav(pcm: bytes, samplerate: int = 16000, channels: int = 1) -> bytes:
         + struct.pack("<I", data_size)
         + pcm
     )
+
+
+class _StalledAudio(FakeAudio):
+    """Takes no audio until released: playback far behind the upload, at its most extreme."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def stream_pcm(self, pcm_chunks, **kwargs) -> None:
+        await self.release.wait()
+        await super().stream_pcm(pcm_chunks, **kwargs)
+
+
+class TestUploadFasterThanPlayback:
+    """A client sends far faster than real time, so the socket must keep being read.
+
+    If it weren't, pongs would sit unread behind the audio, the keepalive would drop
+    a healthy upload, and whatever was still unread would be lost.
+    """
+
+    @pytest.fixture
+    async def stalled_rig(self) -> AsyncIterator[tuple[_StalledAudio, int]]:
+        backend = _StalledAudio()
+        await backend.start()
+        bus = EventBus()
+        audio = Audio(backend, bus)
+        server = Server(
+            Dispatcher(), bus, TokenAuth(TOKEN), motion=MotionOwners(), bind="127.0.0.1", port=0,
+            ping_interval=0.2, ping_timeout=0.2, close_timeout=0.2,
+        )
+        self.closes: list[int | None] = []
+        inner = build_audio_out_handler(audio)
+
+        async def handler(ws) -> None:
+            await inner(ws)
+            self.closes.append(ws.close_code)
+
+        server.add_path_handler("/audio/out", handler)
+        await server.start()
+        port = server._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+        try:
+            yield backend, port
+        finally:
+            backend.release.set()
+            await audio.stop_play()
+            await backend.stop()
+            await server.stop()
+
+    async def test_upload_finishes_ahead_of_playback_and_all_of_it_plays(
+        self, stalled_rig
+    ) -> None:
+        backend, port = stalled_rig
+        frame = bytes(4096)
+        # Big enough that the close can't finish before the first ping. A small
+        # upload gets through either way, so it wouldn't test anything.
+        frames = 2000
+        ws = await websockets.connect(
+            f"ws://127.0.0.1:{port}/audio/out",
+            subprotocols=["bearer", TOKEN],  # type: ignore[list-item]
+            ping_interval=None,  # as a browser: it answers pings and sends none
+            close_timeout=60,
+        )
+        await ws.send(_make_wav(b""))
+        for _ in range(frames):
+            await ws.send(frame)
+        await asyncio.wait_for(ws.close(), timeout=2.0)
+        # Longer than the keepalive needs to drop a connection it can't hear.
+        await asyncio.sleep(0.8)
+        assert not backend.streamed()
+        backend.release.set()
+        for _ in range(100):
+            if backend.streamed():
+                break
+            await asyncio.sleep(0.02)
+        assert backend.streamed()[0]["total_bytes"] == frames * len(frame)
+        assert self.closes == [1000]
+
+    async def test_upload_cap_still_applies_while_playback_is_behind(
+        self, stalled_rig, monkeypatch
+    ) -> None:
+        import rsc_host.audio_endpoints as endpoints
+
+        monkeypatch.setattr(endpoints, "_MAX_UPLOAD_BYTES", 40_000)
+        _, port = stalled_rig
+        ws = await _connect(port, "/audio/out")
+        await ws.send(_make_wav(b""))
+        with pytest.raises(websockets.ConnectionClosed):
+            for _ in range(100):
+                await ws.send(bytes(4096))
+                await asyncio.sleep(0.001)
+            await ws.recv()
+        assert ws.close_code == 1009
 
 
 class TestAudioOut:

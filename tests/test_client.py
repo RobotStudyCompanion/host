@@ -16,6 +16,7 @@ from rsc_host.auth import TokenAuth
 from rsc_host.client import RSCError, connect
 from rsc_host.dispatch import Dispatcher
 from rsc_host.events import EventBus
+from rsc_host.motion import MotionOwners
 from rsc_host.protocol import Event
 from rsc_host.server import Server
 
@@ -65,7 +66,7 @@ async def running_daemon() -> AsyncIterator[tuple[Dispatcher, EventBus, int]]:
             "latest_seq": bus.latest_seq(),
         }
 
-    server = Server(dispatcher, bus, auth, bind="127.0.0.1", port=0)
+    server = Server(dispatcher, bus, auth, motion=MotionOwners(), bind="127.0.0.1", port=0)
     await server.start()
     port = server._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
 
