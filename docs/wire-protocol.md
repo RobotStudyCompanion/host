@@ -428,10 +428,12 @@ a short ramp is still legible rather than arriving as a single jump.
 
 ### `/audio/out`: upload WAV, daemon plays it
 
-Send WAV bytes as binary frames, split however convenient. The daemon buffers
-until it can parse the header, extracts rate, channels and width from `fmt `,
-then streams the PCM to ALSA as it arrives. On client close it drains and
-closes.
+Send WAV bytes as binary frames, split however convenient, as fast as you like.
+The daemon buffers until it can parse the header, extracts rate, channels and
+width from `fmt `, then streams the PCM to ALSA as it arrives. It keeps reading
+ahead of playback, holding up to the 20 MB cap in memory. On client close it
+plays what it holds to the end, so closing as soon as the last frame is sent
+doesn't cut the clip short.
 
 Lifecycle events go to the control channel, not this socket.
 
