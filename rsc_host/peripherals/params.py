@@ -1,60 +1,79 @@
-"""Validation for the free-form ``params`` of the ring and the button LED.
+"""Validation and parsing for the free-form ``params`` of the ring and button LED.
 
 These arrive as an untyped dict and reach a background task that nobody awaits,
 so a bad value must be turned away before the running pattern is touched. A
 failure raises ``ValueError``, which the dispatcher reports as ``INVALID_ARGS``.
 
 A field is checked whenever it is present, including in modes that don't use it.
-Fields that are absent keep each mode's own default.
+Fields that are absent keep each mode's own default. The dict is only checked,
+never rewritten, so the modes read exactly what the client sent.
 """
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Annotated, Any
 
-#: The floor exists so a tiny period can't become a loop that starves the event
-#: loop; the ceiling, because nobody can tell a slower pattern from a stuck one.
-PERIOD_MS_MIN = 50
-PERIOD_MS_MAX = 60_000
+from pydantic import Field, Strict, TypeAdapter, ValidationError
 
-COLOUR_MIN = 0
-COLOUR_MAX = 255
+from rsc_host.hal.types import Colour
 
-DUTY_MIN = 0.0
-DUTY_MAX = 1.0
+# Strict turns away bool and strings, which lax mode would coerce. NaN and
+# infinity are refused outright: json.loads accepts both.
+#
+# The period's floor exists so a tiny period can't become a loop that starves
+# the event loop; its ceiling, because nobody can tell a slower pattern from a
+# stuck one.
+_Period = Annotated[float, Strict(), Field(ge=50, le=60_000, allow_inf_nan=False)]
+_Duty = Annotated[float, Strict(), Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+_Channel = Annotated[float, Strict(), Field(ge=0, le=255, allow_inf_nan=False)]
+
+_FIELDS: dict[str, TypeAdapter[Any]] = {
+    "period_ms": TypeAdapter(_Period),
+    "duty": TypeAdapter(_Duty),
+    "r": TypeAdapter(_Channel),
+    "g": TypeAdapter(_Channel),
+    "b": TypeAdapter(_Channel),
+    "rgb": TypeAdapter(tuple[_Channel, _Channel, _Channel]),
+}
+
+# How pydantic reports a list that is too short or too long. Only ``rgb``, the
+# one fixed-length field, can raise these.
+_WRONG_LENGTH = {"missing", "too_long"}
+
+#: The fields each peripheral checks.
+RING_FIELDS = ("period_ms", "r", "g", "b", "rgb")
+LED_FIELDS = ("period_ms", "duty")
 
 
-def _check_range(name: str, value: Any, low: float, high: float) -> None:
-    # bool is an int to Python, so it needs turning away by name.
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a number, got {value!r}")
-    # json.loads accepts NaN and Infinity. Both fail this: NaN compares false to
-    # everything, and infinity is beyond any limit.
-    if not low <= value <= high:
-        raise ValueError(f"{name} must be in [{low}, {high}], got {value!r}")
+def check(params: dict[str, Any], fields: Iterable[str]) -> None:
+    """Raise ``ValueError`` for the first of ``fields`` that is present and bad."""
+    for name in fields:
+        if name not in params:
+            continue
+        value = params[name]
+        try:
+            _FIELDS[name].validate_python(value)
+        except ValidationError as exc:
+            # Re-raised short: pydantic's own text runs to several lines and a URL.
+            error = exc.errors()[0]
+            if error["type"] in _WRONG_LENGTH:
+                raise ValueError(
+                    f"{name}: must be a list of exactly 3 numbers, got {value!r}"
+                ) from None
+            where = "".join(f"[{part}]" for part in error["loc"])
+            raise ValueError(f"{name}{where}: {error['msg']}, got {value!r}") from None
 
 
-def check_period_ms(params: dict[str, Any]) -> None:
-    if "period_ms" in params:
-        _check_range("period_ms", params["period_ms"], PERIOD_MS_MIN, PERIOD_MS_MAX)
+def parse_colour(params: dict[str, Any], default: Colour) -> Colour:
+    """The colour in ``params``, given as ``rgb: [r, g, b]`` or as ``r``, ``g``, ``b``.
 
-
-def check_duty(params: dict[str, Any]) -> None:
-    if "duty" in params:
-        _check_range("duty", params["duty"], DUTY_MIN, DUTY_MAX)
-
-
-def check_colour(params: dict[str, Any]) -> None:
-    """Check whichever of ``r``, ``g``, ``b`` and ``rgb`` are present.
-
-    A partial ``r``/``g``/``b`` is allowed, because the mode then falls back to
-    its default colour, but any part that is present must still be valid.
+    ``rgb`` wins when both are given. A partial ``r``/``g``/``b`` falls back to
+    ``default``. Fractions truncate. Assumes :func:`check` has already passed.
     """
-    for name in ("r", "g", "b"):
-        if name in params:
-            _check_range(name, params[name], COLOUR_MIN, COLOUR_MAX)
     if "rgb" in params:
-        rgb = params["rgb"]
-        if not isinstance(rgb, (list, tuple)) or len(rgb) != 3:
-            raise ValueError(f"rgb must be a list of exactly three values, got {rgb!r}")
-        for name, value in zip("rgb", rgb, strict=True):
-            _check_range(f"rgb {name}", value, COLOUR_MIN, COLOUR_MAX)
+        r, g, b = params["rgb"]
+    elif "r" in params and "g" in params and "b" in params:
+        r, g, b = params["r"], params["g"], params["b"]
+    else:
+        return default
+    return Colour(int(r), int(g), int(b))

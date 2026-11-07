@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -151,6 +152,13 @@ class TestParamValidation:
         first = await backend.get_frame()
         await asyncio.sleep(0.05)
         assert await backend.get_frame() != first
+
+    @pytest.mark.parametrize("rgb", [[1, 2], [1, 2, 3, 4], [], [1]], ids=repr)
+    async def test_wrong_length_rgb_says_so(self, rig, rgb) -> None:
+        ring, _, _ = rig
+        message = f"rgb: must be a list of exactly 3 numbers, got {rgb!r}"
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            await ring.set_mode("solid", {"rgb": rgb})
 
     async def test_unknown_mode_leaves_pattern_running(self, rig) -> None:
         ring, _, _ = rig

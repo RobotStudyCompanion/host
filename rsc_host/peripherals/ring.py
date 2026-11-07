@@ -37,7 +37,7 @@ from rsc_host.errors import PeripheralUnavailableError
 from rsc_host.events import EventBus
 from rsc_host.hal.base import RingBackend
 from rsc_host.hal.types import Colour
-from rsc_host.peripherals.params import check_colour, check_period_ms
+from rsc_host.peripherals.params import RING_FIELDS, check, parse_colour
 from rsc_host.protocol import Event
 
 log = logging.getLogger(__name__)
@@ -73,17 +73,6 @@ def registered_modes() -> tuple[str, ...]:
 # ---- Built-in modes ----
 
 
-def _parse_colour(params: dict[str, Any], default: Colour = Colour(255, 255, 255)) -> Colour:
-    """Pull an RGB triple out of ``params``. Supports ``{r,g,b}`` or ``rgb: [r,g,b]``."""
-    if "rgb" in params:
-        r, g, b = params["rgb"]
-    elif "r" in params and "g" in params and "b" in params:
-        r, g, b = params["r"], params["g"], params["b"]
-    else:
-        return default
-    return Colour(int(r), int(g), int(b))
-
-
 @ring_mode("off")
 async def _off(backend: RingBackend, params: dict[str, Any]) -> None:
     """All pixels off. Runs once and holds forever."""
@@ -97,7 +86,7 @@ async def _off(backend: RingBackend, params: dict[str, Any]) -> None:
 @ring_mode("solid")
 async def _solid(backend: RingBackend, params: dict[str, Any]) -> None:
     """Fill with a single colour and hold."""
-    colour = _parse_colour(params, default=Colour(255, 255, 255))
+    colour = parse_colour(params, Colour(255, 255, 255))
     await backend.fill(colour)
     await backend.show()
     await asyncio.Event().wait()
@@ -111,7 +100,7 @@ async def _pulse(backend: RingBackend, params: dict[str, Any]) -> None:
         colour params (r/g/b or rgb)
         period_ms: pulse period in ms (default 1500)
     """
-    colour = _parse_colour(params, default=Colour(0, 80, 255))
+    colour = parse_colour(params, Colour(0, 80, 255))
     period_ms = int(params.get("period_ms", 1500))
     frame_period = 0.03  # ~33 Hz
     t = 0.0
@@ -138,7 +127,7 @@ async def _spin(backend: RingBackend, params: dict[str, Any]) -> None:
         colour params (r/g/b or rgb)
         period_ms: full-revolution time (default 1000)
     """
-    colour = _parse_colour(params, default=Colour(0, 80, 255))
+    colour = parse_colour(params, Colour(0, 80, 255))
     period_ms = int(params.get("period_ms", 1000))
     n = backend.pixel_count
     step_period = (period_ms / 1000.0) / n
@@ -197,8 +186,7 @@ class Ring:
                 f"unknown ring mode: {mode!r}; known: {registered_modes()}"
             )
         params = params or {}
-        check_period_ms(params)
-        check_colour(params)
+        check(params, RING_FIELDS)
         if not self._backend.available:
             status = self._backend.status()
             raise PeripheralUnavailableError(
