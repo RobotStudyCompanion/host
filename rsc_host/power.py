@@ -126,3 +126,40 @@ async def request(action: str, delay: float = DEFAULT_DELAY) -> dict:
     asyncio.create_task(_invoke(method, delay), name=f"power-{action}")
     log.warning("%s requested; going down in %.1f s", action, delay)
     return {"scheduled": True, "action": action, "delay_s": delay}
+
+# ---- Backends ----
+#
+# setup() picks one by backend, as it does for the hardware. A laptop running
+# the fake backend must never ask logind to power off the laptop: with a
+# permissive polkit setup it would.
+
+
+class LogindPower:
+    """The real thing: asks logind through ``busctl``."""
+
+    async def status(self) -> dict:
+        return await status()
+
+    async def request(self, action: str, delay: float = DEFAULT_DELAY) -> dict:
+        return await request(action, delay)
+
+
+class FakePower:
+    """Always allowed, never acts. Logs what it would have done.
+
+    Gives the same replies as :class:`LogindPower` when logind says yes, so a
+    console can run the whole shutdown flow against a laptop.
+    """
+
+    async def status(self) -> dict:
+        return {"can_power_off": "yes", "can_reboot": "yes", "allowed": True}
+
+    async def request(self, action: str, delay: float = DEFAULT_DELAY) -> dict:
+        if action not in ("poweroff", "reboot"):
+            raise ValueError(f"unknown power action: {action!r}")
+        log.warning(
+            "fake backend: would %s in %.1f s",
+            "power off" if action == "poweroff" else "reboot",
+            delay,
+        )
+        return {"scheduled": True, "action": action, "delay_s": delay}

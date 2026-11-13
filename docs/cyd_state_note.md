@@ -1,8 +1,10 @@
 # Two surfaces, one truth: CYD and console state
 
-A scenario-driven analysis of front-panel state synchronisation, plus the
-firmware changes it implies. The host side is built; the CYD side is specified
-here for whoever picks it up.
+A scenario-driven analysis of front-panel state synchronisation, and the
+serial contract that came out of it. **Specified:** the serial lines below were
+agreed with the firmware and the console on 8 Nov 2026 (step 2, sync). The
+host side is built on branch `sync`; the firmware side is built against this
+note.
 
 ---
 
@@ -96,9 +98,73 @@ is worse, surprise is recoverable, silent inconsistency is not.
 
 ---
 
+## Who owns what
+
+| State | Owner | Why |
+|---|---|---|
+| Volume, mute, mic mute | **Host** | The mixer is on the Pi. The screen only shows it. |
+| Face shown, cycling, brightness, auto-brightness | **Screen** | Saved on the screen, and while cycling the screen picks the face itself. The host records what the screen reports and passes it on. |
+
+**Loop rule.** The screen never sends a `host_*` line in reply to a host
+command about volume, mute or mic. The host never sends a command in reply to
+a report line. Request lines (`host_vol`, `host_mute`, `host_mic`,
+`host_reboot`, `host_poweroff`) make the host act. Report lines only update
+what the host records.
+
+---
+
+## Serial contract (agreed)
+
+The firmware's grammar is unchanged: `key:value` sets, `key?` gets, plain `key`
+runs an action. Replies are `OK`, `ERR: …`, or `key:   value` (padded). The
+host ignores every line that doesn't start with `host_`, apart from the `vol?`
+probe reply.
+
+**Host → screen, new or changed**
+
+| Line | Screen does | Reply |
+|---|---|---|
+| `vol:NN` (0–100) | Moves the slider and the icon. Sends no `host_vol`. Not saved. | `OK` / `ERR: 0-100` |
+| `vol?` | | `vol:   NN`. The host's probe; it means the firmware can show host state. |
+| `mute:on\|off`, `mute?` | Sets the speaker icon. Not saved. | `OK` / `mute:   on` |
+| `mic_mute:on\|off`, `mic_mute?` | Sets the mic icon; `on` = muted. Not saved. Called `mic:` in earlier drafts; renamed because `mic:on` meaning "muted" invites a bug. | `OK` / `mic_mute:   on` |
+| `screen:off\|on`, `screen?` | `off`: backlight fully off (PWM 0, saved brightness kept), face paused, auto-brightness held off, touch ignored, menu closed. `on`: back to saved brightness, face resumes. Not saved; the screen always boots on. | `OK` / `screen:   on` |
+| `report` | Sends the four report lines below. | report lines, then `OK` |
+| `blink` | Blinks at once. | `OK` |
+| `mood:X`, `mood_cycle:on\|off`, `bright:NN`, `auto_bright:on\|off`, `face:…`, `face_l:…`, `face_r:…` | Unchanged, but each now also sends its report line. | as before |
+
+**Screen → host, new**
+
+| Line | Sent when |
+|---|---|
+| `host_ready` | At the end of the screen's `setup()`, followed by a full report. The host then knows the screen restarted. |
+| `host_face:MOOD` | Every time the face shown changes: the `mood:` command, cycling, the idle animation, and in every report. One of the 10 mood names (`NEUTRAL`, `HAPPY`, `ANGRY`, `SAD`, `EXCITED`, `ANNOYED`, `QUESTIONING`, `IDLE1`–`IDLE3`), or `CUSTOM` after `face`/`face_l`/`face_r`. |
+| `host_cycle:on\|off` | When cycling is switched, and in every report. |
+| `host_bright:NN` | When the brightness *setting* changes (command or slider; the slider is throttled and always sends its last value), and in every report. Not for auto-brightness's continuous changes. Replaces the slider's `bright:NN` echo. |
+| `host_auto_bright:on\|off` | When it changes (command, the menu icon, or `bright:` turning it off), and in every report. |
+
+`host_vol` is unchanged, except that the slider's last value is now always
+sent. `host_mute`, `host_mic`, `host_reboot` and `host_poweroff` are unchanged.
+A press on the panel still flips its own icon at once, and the host's push
+corrects it.
+
+**Host start-up sequence**
+
+1. `vol?`.
+2. If it answers `vol:`: `vol:NN`, `mute:…`, `mic_mute:…`, then `screen:on`.
+   Old firmware gets `resume` instead.
+3. `report`. Old firmware answers `ERR`, which is ignored.
+
+**Shutdown.** Only once logind has said yes: `screen:off`, or `pause`, `clear`,
+`led:off` for old firmware. No mood is sent; it would be saved on the screen
+and still showing after the reboot.
+
+---
+
 ## Host side (built)
 
-`CydBridge` gains a capability probe and a push method.
+`CydBridge` has a capability probe, a push method, and a record of the
+screen's state.
 
 **The probe.** At start the bridge sends `vol?`. Current firmware answers
 `ERR: unknown command 'vol'`; patched firmware answers `vol: NN`. The bridge
@@ -115,11 +181,25 @@ Push is silent when unsupported. It fires on every volume change, and a warning
 per message would bury the journal under a condition already reported once at
 startup and visible in `peripherals.status` as `cyd.state_push`.
 
+**`host_ready`.** A screen plugged in after the probe timed out, or restarted
+on its own, sends `host_ready`. The bridge turns push on and the host pushes
+volume, mute and mic mute again.
+
+**Screen state.** The bridge keeps `mood`, `cycle`, `bright`, `auto_bright`
+(each `null` until known) and `reports` (false until a report line or
+`host_ready` arrives). Sending `mood`, `mood_cycle`, `bright` or `face` records
+the value at once, so old firmware still gives every console the same view; a
+report line overrides it. Any change publishes `cyd.state`, and
+`peripherals.status.cyd.state` carries the same object. The wire side is in
+`wire-protocol.md`.
+
 ---
 
-## CYD firmware changes (for later)
+## CYD firmware sketches
 
-Three commands, one bug fix. All in the existing dispatch-table pattern.
+Sketches for `vol`, `mute` and `mic_mute`, and the slider fix, in the existing
+dispatch-table pattern. The contract above is what counts; `screen`, `report`
+and the report lines are specified there and not sketched here.
 
 ### 1. `vol:NN`: set slider position without emitting
 
@@ -150,7 +230,7 @@ if (_suppressVolEmit) { _volumeLevel = v; refreshVolumeIcon(); break; }
 The getter is what the host probes for, so it must exist even if nothing else
 reads it.
 
-### 2. `mute:on|off` and `mic:on|off`: set state, not toggle
+### 2. `mute:on|off` and `mic_mute:on|off`: set state, not toggle
 
 ```cpp
 static void cmdSetMute(const String &val) {
@@ -160,14 +240,14 @@ static void cmdSetMute(const String &val) {
 }
 static void cmdGetMute() { Serial.printf("mute:           %s\n", _muted ? "on" : "off"); }
 
-static void cmdSetMic(const String &val) {
+static void cmdSetMicMute(const String &val) {
     bool b;
     if (!parseBool(val, b)) { Serial.println("ERR: bad bool"); return; }
     _micMuted = b;
     applyIcon(_refMic, _micMuted ? mute_on_icon_40x40px : mic_on_icon_40x40px);
     Serial.println("OK");
 }
-static void cmdGetMic() { Serial.printf("mic:            %s\n", _micMuted ? "on" : "off"); }
+static void cmdGetMicMute() { Serial.printf("mic_mute:       %s\n", _micMuted ? "on" : "off"); }
 ```
 
 Absolute, not toggling. The host sends what it decided; the panel does not
@@ -183,7 +263,7 @@ move the setters into that file and declare them in its header, or drop the
 ```cpp
 {"vol",   cmdSetVol,  cmdGetVol,  "0-100 host volume (display only; host owns the mixer)"},
 {"mute",  cmdSetMute, cmdGetMute, "on|off host mute state"},
-{"mic",   cmdSetMic,  cmdGetMic,  "on|off host mic mute state"},
+{"mic_mute", cmdSetMicMute, cmdGetMicMute, "on|off host mic mute state (on = muted)"},
 ```
 
 Do **not** add these to NVS. They mirror host state, and restoring a stale
@@ -237,10 +317,11 @@ fix; the push cannot substitute for it.
 
 Once the firmware lands, the daemon needs no change. On restart the log should
 say `CYD state push enabled` and `peripherals.status` should report
-`cyd.state_push: true`.
+`cyd.state_push: true`, then `cyd.reports: true` once the report arrives.
 
 Then the scenario, end to end: mute at the panel, unmute at the console, and
-watch the panel icon correct itself.
+watch the panel icon correct itself. Set a mood in one console and see it in
+another. Refuse a shutdown (no polkit rule) and see nothing change.
 
 ---
 

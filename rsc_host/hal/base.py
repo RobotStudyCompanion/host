@@ -367,3 +367,7 @@ class AudioBackend(Backend):
     async def set_mic_mute(self, muted: bool) -> dict:
         """Disconnect or reconnect the microphone."""
         raise self._unsupported("microphone mute")
+
+    async def get_mic_mute(self) -> dict:
+        """Current microphone mute state."""
+        raise self._unsupported("microphone mute")
