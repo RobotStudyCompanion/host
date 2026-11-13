@@ -221,3 +221,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 /net-commander
+
+# Local notes for Claude Code sessions
+CLAUDE.md

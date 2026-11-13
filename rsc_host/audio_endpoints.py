@@ -96,7 +96,12 @@ def build_audio_out_handler(audio: Audio):
         # then hand a live async iterator of PCM chunks to Audio.stream().
         header_buf = bytearray()
         total_received = 0
-        pcm_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        # Unbounded on purpose; _MAX_UPLOAD_BYTES is what limits it. Playback
+        # takes data at real time and a client sends faster, so a limit here
+        # would stop this loop reading the socket. Pongs arrive in order behind
+        # the unread audio, and the keepalive would then drop a healthy upload
+        # and lose whatever was still unread.
+        pcm_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def _pcm_iter():
             """Async iterator drained by Audio.stream(); yields PCM chunks."""

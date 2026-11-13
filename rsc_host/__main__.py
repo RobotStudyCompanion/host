@@ -131,6 +131,7 @@ async def _run(config: Config) -> None:
         bind=config.bind,
         port=config.port,
         ssl_context=ssl_ctx,
+        motion=peripherals.motion,
     )
 
     # Binary audio endpoints. Path routing lives in Server; the handlers here
