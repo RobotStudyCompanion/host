@@ -1687,6 +1687,9 @@ class PiAudioBackend(AudioBackend):
         self._mic_muted = bool(muted)
         return {"mic_muted": self._mic_muted, "controls": applied}
 
+    async def get_mic_mute(self) -> dict:
+        return {"mic_muted": self._mic_muted}
+
     def _persist_audio_state(self) -> None:
         if self._state is None or not self._state.available:
             return
