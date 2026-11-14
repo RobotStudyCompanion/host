@@ -203,6 +203,10 @@ class AudioSettings:
                 raise ValueError(
                     f"RSC_HOST_AUDIO_SAMPLERATE must be an integer: {exc}"
                 ) from exc
+            if stream_default < 1:
+                raise ValueError(
+                    f"RSC_HOST_AUDIO_SAMPLERATE must be >= 1, got {stream_default}"
+                )
         if os.environ.get("RSC_HOST_AUDIO_CHANNELS", "").strip():
             log.warning(
                 "RSC_HOST_AUDIO_CHANNELS is deprecated and ignored. The device "

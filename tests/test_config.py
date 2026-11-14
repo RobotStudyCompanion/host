@@ -53,8 +53,8 @@ class TestDefaults:
         assert cfg.log_level == "INFO"
         assert cfg.advertise is True
         assert cfg.robot_name is None
-        assert cfg.audio_input is None
-        assert cfg.audio_output is None
+        assert cfg.audio_input == "plughw:0,0"
+        assert cfg.audio_output == "plughw:0,0"
         assert cfg.audio_samplerate == 16000
         assert cfg.audio_channels == 1
 
@@ -151,19 +151,20 @@ class TestAdvertise:
 
 
 class TestAudio:
-    def test_input_as_integer(self, clean_env: pytest.MonkeyPatch) -> None:
+    def test_input_numeric_stays_string(self, clean_env: pytest.MonkeyPatch) -> None:
+        # Passed verbatim to arecord -D, so a number is an ALSA name, not an index.
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
         clean_env.setenv("RSC_HOST_AUDIO_INPUT", "2")
-        assert load_from_env().audio_input == 2
+        assert load_from_env().audio_input == "2"
 
     def test_input_as_string_name(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
         clean_env.setenv("RSC_HOST_AUDIO_INPUT", "USB Microphone")
         assert load_from_env().audio_input == "USB Microphone"
 
-    def test_output_defaults_none(self, clean_env: pytest.MonkeyPatch) -> None:
+    def test_output_default(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
-        assert load_from_env().audio_output is None
+        assert load_from_env().audio_output == "plughw:0,0"
 
     def test_samplerate_custom(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
@@ -182,13 +183,15 @@ class TestAudio:
         with pytest.raises(ValueError, match="AUDIO_SAMPLERATE"):
             load_from_env()
 
-    def test_channels_stereo(self, clean_env: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("value", ["2", "5"])
+    def test_channels_deprecated_and_ignored(
+        self,
+        clean_env: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        # The chain always emits mono; the old variable only earns a warning.
         clean_env.setenv("RSC_HOST_TOKEN", "dev")
-        clean_env.setenv("RSC_HOST_AUDIO_CHANNELS", "2")
-        assert load_from_env().audio_channels == 2
-
-    def test_channels_invalid(self, clean_env: pytest.MonkeyPatch) -> None:
-        clean_env.setenv("RSC_HOST_TOKEN", "dev")
-        clean_env.setenv("RSC_HOST_AUDIO_CHANNELS", "5")
-        with pytest.raises(ValueError, match="AUDIO_CHANNELS"):
-            load_from_env()
+        clean_env.setenv("RSC_HOST_AUDIO_CHANNELS", value)
+        assert load_from_env().audio_channels == 1
+        assert "RSC_HOST_AUDIO_CHANNELS is deprecated" in caplog.text

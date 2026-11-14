@@ -84,7 +84,11 @@ class TestEndToEnd:
             Cmd(id="c3", verb="cyd.mood", args={"value": "HAPPY"})
         )
         assert ack.ok is True
-        assert peripherals.serial_backend.written() == ("mood:HAPPY",)
+        # Setup also sends the "vol?" capability probe; ignore it here.
+        written = [
+            line for line in peripherals.serial_backend.written() if line != "vol?"
+        ]
+        assert written == ["mood:HAPPY"]
 
     async def test_button_edge_fires_event(self, rig) -> None:
         _, bus, peripherals = rig
