@@ -37,17 +37,18 @@ The Python part:
 
 ```bash
 python3 -m venv --system-site-packages ~/rsc-env
-~/rsc-env/bin/pip install -e ".[pi]"
+~/rsc-env/bin/pip install pydantic websockets numpy pyserial-asyncio zeroconf
 ```
 
 `--system-site-packages` matters: `lgpio` and `gpiozero` come from apt on a Pi
-and are awkward to build from source. The `[ring]` extra is separate because
-the ring helper runs as a different process, possibly under a different
-interpreter.
+and are awkward to build from source. The ring helper's packages (the `[ring]`
+extra in `pyproject.toml`) are not in this list: the helper runs as a separate
+root process, possibly under a different interpreter, and they go into
+whichever one runs it.
 
-**One virtualenv only.** Do not also `pip install -e .` on the robot. A package
-installed into site-packages shadows the source tree, and the daemon will run
-the installed copy while you edit the other.
+**Do not `pip install` the package on the robot**, editable or not, in this or
+any other virtualenv. A package installed into site-packages shadows the source
+tree, and the daemon will run the installed copy while you edit the other.
 
 ### On a laptop
 
@@ -69,9 +70,15 @@ and degrades with a log line rather than a crash.
 pytest
 ```
 
-`tests/test_config.py` currently fails in five places. Four are tests that
-predate a deliberate configuration change and need updating; one is a genuine
-missing validation. Not yet done.
+On a robot, install only the test runners and run from the source tree:
+
+```bash
+~/rsc-env/bin/pip install pytest pytest-asyncio
+cd ~/rsc-host && ~/rsc-env/bin/python -m pytest
+```
+
+The whole suite is expected to pass. It runs against the fake backend and
+touches no hardware.
 
 ## Run
 
@@ -106,8 +113,8 @@ opened from disk against any robot on the same network.
 `RSC_HOST_TOKEN` is required and has no default. Everything else does, and the
 defaults are values measured on the chassis rather than guessed. The reasoning
 and the measurements behind each are recorded in
-[`docs/configuration.md`](docs/configuration.md), which covers all 51
-variables.
+[`docs/configuration.md`](docs/configuration.md), which covers every
+variable.
 
 Settings changed from the console are written to `/var/lib/rsc-host/` and layer
 over the shipped defaults, so per-robot tuning and the shipped recipe coexist
@@ -130,7 +137,9 @@ rsc_host/
   server.py            WebSocket server
   audio_endpoints.py   Binary audio handlers
   discovery.py         Network service advertisement
-  client.py            Python client library
+  motion.py            Who owns each moving part; stops it on disconnect
+  client/              Python client library
+  cli/                 Command-line tools (audio check)
   ring_helper.py       Root-only LED ring daemon, its own service
   hal/                 Hardware abstraction layer
     types.py           Colour, Edge, GpioEdge
@@ -144,6 +153,7 @@ rsc_host/
     ring.py            Mode machine
     button.py          Edge debouncing
     button_led.py      Brightness modes
+    params.py          Validation for ring and button LED params
     cyd.py             Front-panel serial bridge
     audio.py           Playback and capture sessions
 
@@ -172,15 +182,12 @@ debouncing, mode machines, capture sessions.
 Three decisions look odd until you know the reason, and all three came from
 measurement rather than preference.
 
-**The general-purpose input/output layer uses lgpio, not pigpio.** An earlier
-investigation concluded the Pi could not drive servos, the ring and digital
-audio concurrently, and recommended adding a co-processor. That was wrong. The
-cause was a malformed `pigpiod` service file whose stop command killed its own
+**The general-purpose input/output layer uses lgpio, not pigpio.** Under
+pigpio, servos, the ring and digital audio could not run together. The cause
+was a malformed `pigpiod` service file whose stop command killed its own
 transaction, leaving hardware resources unrestored. With pigpio masked and
-everything moved to lgpio, all peripherals run together. The full account, and
-the two lgpio pitfalls it introduced, are in
-[`docs/pi-setup.md`](docs/pi-setup.md#why-not-pigpio). Do not reintroduce
-pigpio.
+everything moved to lgpio, all peripherals run together.
+The full account, and the two lgpio pitfalls it introduced, are in [`docs/pi-setup.md`](docs/pi-setup.md#why-not-pigpio). Do not reintroduce pigpio.
 
 **The LED ring runs in a separate root process.** It sits on a pin whose timing
 must be driven by direct memory access, which needs privileges the unprivileged
@@ -202,7 +209,7 @@ levels and the reasoning are in
 | [`docs/README.md`](docs/README.md) | Index, and what is still unresolved |
 | [`docs/pi-setup.md`](docs/pi-setup.md) | Fresh Pi to running service |
 | [`docs/configuration.md`](docs/configuration.md) | Every environment variable |
-| [`docs/wire-protocol.md`](docs/wire-protocol.md) | All 38 verbs, events, binary endpoints |
+| [`docs/wire-protocol.md`](docs/wire-protocol.md) | Every verb, event and binary endpoint |
 | [`docs/cyd_state_note.md`](docs/cyd_state_note.md) | Front-panel state, and the firmware changes it needs |
 | [`docs/notes_on_audio.md`](docs/notes_on_audio.md) | Capture levels and known artefacts |
 
