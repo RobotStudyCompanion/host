@@ -54,7 +54,8 @@ async def running_daemon() -> AsyncIterator[tuple[Dispatcher, EventBus, int]]:
 
     @dispatcher.verb("boom", args_model=_EmptyArgs)
     async def _boom(_args: _EmptyArgs) -> dict:
-        raise ValueError("oops")
+        # Not ValueError: the dispatcher reports that as INVALID_ARGS.
+        raise RuntimeError("oops")
 
     @dispatcher.verb("events.history", args_model=_HistoryArgs)
     async def _history(args: _HistoryArgs) -> dict:

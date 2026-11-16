@@ -148,16 +148,33 @@ sent. `host_mute`, `host_mic`, `host_reboot` and `host_poweroff` are unchanged.
 A press on the panel still flips its own icon at once, and the host's push
 corrects it.
 
-**Host start-up sequence**
+**Host start-up sequence** (probe and wake revised in step 2b, 17 Nov)
 
-1. `vol?`.
-2. If it answers `vol:`: `vol:NN`, `mute:…`, `mic_mute:…`, then `screen:on`.
-   Old firmware gets `resume` instead.
-3. `report`. Old firmware answers `ERR`, which is ignored.
+1. An empty line. Any half-received bytes in the screen's buffer are then
+   parsed and answered on their own. The host waits 200 ms and ignores what
+   comes back.
+2. `vol?`. Only a reply starting `vol:` counts. On `ERR` or no reply (0.5 s),
+   ask again, up to 3 attempts in all. Old firmware answers `ERR` each time.
+3. If it answered `vol:`: `vol:NN`, `mute:…`, `mic_mute:…`.
+4. `screen:on` **and** `resume`, every time, whatever the probe said. Old
+   firmware answers `ERR` to `screen:on`; new firmware takes `resume` as
+   harmless. A probe garbled three times can no longer leave the screen dark.
+5. `report`. Old firmware answers `ERR`, which is ignored.
+
+A screen that was missed (unplugged, or garbled every time) still sends
+`host_ready` when it boots, and the host then turns push on and pushes the
+audio state.
+
+The firmware side (step 2b): a partial line is discarded if no byte arrives
+for 200 ms, and a long press while the screen is off turns it back on.
 
 **Shutdown.** Only once logind has said yes: `screen:off`, or `pause`, `clear`,
 `led:off` for old firmware. No mood is sent; it would be saved on the screen
-and still showing after the reboot.
+and still showing after the reboot. If logind refuses the call afterwards, the
+host wakes the screen again (`screen:on`, `resume`).
+
+**Report lines are not published as events** (step 2b). They update the host's
+record of the screen, which goes out as `cyd.state` on a change.
 
 ---
 
@@ -166,11 +183,13 @@ and still showing after the reboot.
 `CydBridge` has a capability probe, a push method, and a record of the
 screen's state.
 
-**The probe.** At start the bridge sends `vol?`. Current firmware answers
-`ERR: unknown command 'vol'`; patched firmware answers `vol: NN`. The bridge
+**The probe.** At start the bridge sends an empty line, then `vol?` (up to
+three times; see the start-up sequence above). Old firmware answers
+`ERR: unknown command 'vol'`; new firmware answers `vol: NN`. The bridge
 enables pushing only on the latter, so the same daemon works before and after
 the firmware lands with nothing to configure and nothing to remember. A panel
-that does not answer at all times out and is treated as unable.
+that does not answer at all times out and is treated as unable until it sends
+`host_ready`.
 
 **The push.** After every volume, mute or mic change, from the console *or*
 from the panel, the host sends the resulting state. Pushing after a

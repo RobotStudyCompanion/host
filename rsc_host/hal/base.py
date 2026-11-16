@@ -352,8 +352,10 @@ class AudioBackend(Backend):
         """Discard stored changes and return to the shipped preset."""
         raise self._unsupported("mixer persistence")
 
-    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
-        """Set output volume, 0..100."""
+    async def set_volume(
+        self, percent: int, *, persist: bool = False, unmute: bool = True
+    ) -> dict:
+        """Set output volume, 0..100. ``unmute=False`` leaves mute as it is."""
         raise self._unsupported("volume control")
 
     async def get_volume(self) -> dict:

@@ -136,16 +136,25 @@ class TestReportLines:
         async with bus.subscribe() as q:
             first = await _events_until_sentinel(backend, q, "host_face:HAPPY")
             again = await _events_until_sentinel(backend, q, "host_face:HAPPY")
-        assert [e.topic for e in first] == ["host_face", "cyd.state"]
-        assert first[0].source == "cyd" and first[0].data == {"value": "HAPPY"}
-        assert first[1].source == "host"
-        assert first[1].data == {
+        # The report line itself is not published (step 2b, F2); cyd.state is.
+        assert [e.topic for e in first] == ["cyd.state"]
+        assert first[0].source == "host"
+        assert first[0].data == {
             "mood": "HAPPY", "cycle": None, "bright": None,
             "auto_bright": None, "reports": True,
         }
-        # The cyd event is still published; the state did not change.
-        assert [e.topic for e in again] == ["host_face"]
+        assert again == []
         assert cyd.snapshot()["mood"] == "HAPPY"
+
+    async def test_report_lines_publish_only_cyd_state(self, rig) -> None:
+        _, backend, bus = rig
+        async with bus.subscribe() as q:
+            events = await _events_until_sentinel(
+                backend, q,
+                "host_face:SAD", "host_cycle:on", "host_bright:30",
+                "host_auto_bright:on", "host_face:SAD", "host_cycle:on",
+            )
+        assert [e.topic for e in events] == ["cyd.state"] * 4
 
     @pytest.mark.parametrize(
         "line, field, value",
@@ -329,7 +338,9 @@ class TestScreenLines:
         await cyd.screen_on()
         await cyd.screen_off()
         await cyd.request_report()
-        assert backend.written() == ("resume", "pause", "clear", "led:off", "report")
+        assert backend.written() == (
+            "screen:on", "resume", "pause", "clear", "led:off", "report",
+        )
 
     async def test_new_firmware(self, rig) -> None:
         cyd, backend, _ = rig
@@ -337,7 +348,7 @@ class TestScreenLines:
         await cyd.screen_on()
         await cyd.screen_off()
         await cyd.request_report()
-        assert backend.written() == ("screen:on", "screen:off", "report")
+        assert backend.written() == ("screen:on", "resume", "screen:off", "report")
 
     async def test_write_failure_is_not_raised(self, rig) -> None:
         cyd, backend, _ = rig
@@ -348,3 +359,75 @@ class TestScreenLines:
         backend.write_line = broken
         await cyd.screen_off()
         await cyd.request_report()
+
+
+# ---- Step 2b: the start-up probe ----
+
+
+def _answering(backend, replies: dict[str, list[str]]) -> None:
+    """Make ``backend`` answer each written line with the next reply queued for it."""
+    original = backend.write_line
+
+    async def write_line(line: str) -> None:
+        await original(line)
+        queue = replies.get(line)
+        if queue:
+            await backend.inject(queue.pop(0))
+
+    backend.write_line = write_line
+
+
+FAST = {"settle": 0.05, "timeout": 0.1}
+
+
+class TestProbe:
+    async def test_stray_byte_err_then_vol_succeeds(self, rig) -> None:
+        cyd, backend, _ = rig
+        _answering(backend, {
+            # The empty line ends the stray byte's half line; its ERR is ignored.
+            "": ["ERR: unknown command 'x'"],
+            "vol?": ["ERR: unknown command 'xvol'", "vol:   50"],
+        })
+        assert await cyd.probe_push_support(**FAST) is True
+        assert cyd.supports_push is True
+        assert backend.written() == ("", "vol?", "vol?")
+
+    async def test_three_errs_mean_old_firmware(self, rig) -> None:
+        cyd, backend, _ = rig
+        _answering(backend, {"vol?": ["ERR: unknown command 'vol'"] * 3})
+        assert await cyd.probe_push_support(**FAST) is False
+        assert backend.written() == ("", "vol?", "vol?", "vol?")
+
+    async def test_silence_retries_then_gives_up(self, rig) -> None:
+        cyd, backend, _ = rig
+        assert await cyd.probe_push_support(**FAST) is False
+        assert backend.written() == ("", "vol?", "vol?", "vol?")
+
+    async def test_late_reply_to_empty_line_is_not_taken(self, rig) -> None:
+        cyd, backend, _ = rig
+        # Answered during the settle pause: ignored, so the first vol? is clean.
+        _answering(backend, {"": ["OK"], "vol?": ["vol:   10"]})
+        assert await cyd.probe_push_support(**FAST) is True
+        assert backend.written() == ("", "vol?")
+
+    async def test_broken_port_stops_at_once(self, rig) -> None:
+        cyd, backend, _ = rig
+
+        async def broken(line: str) -> None:
+            raise OSError("unplugged")
+
+        backend.write_line = broken
+        assert await cyd.probe_push_support(**FAST) is False
+
+    async def test_host_ready_still_turns_push_on_later(self, rig) -> None:
+        cyd, backend, bus = rig
+        assert await cyd.probe_push_support(**FAST) is False
+        async with bus.subscribe() as q:
+            await _events_until_sentinel(backend, q, "host_ready")
+        assert cyd.supports_push is True
+
+    def test_defaults_match_the_contract(self) -> None:
+        from rsc_host.peripherals import cyd
+
+        assert cyd.PROBE_ATTEMPTS == 3
+        assert cyd.PROBE_SETTLE_S == 0.2

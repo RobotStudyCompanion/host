@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from rsc_host.config import AudioSettings, RingSettings, SerialSettings, ServoSettings
 from rsc_host.errors import PeripheralUnavailableError
@@ -344,6 +346,19 @@ class _AudioSelftestArgs(BaseModel):
         ),
     )
 
+    @field_validator("path")
+    @classmethod
+    def _wav_in_tmp(cls, path: str) -> str:
+        # Any client can call this verb, and the daemon's own folders will soon
+        # hold chats and logs. A .wav directly inside /tmp is all it needs.
+        p = PurePosixPath(path)
+        if p.parent != _SELFTEST_DIR or p.suffix != ".wav" or p.stem in ("", "."):
+            raise ValueError("path must be a .wav file directly inside /tmp")
+        return path
+
+
+_SELFTEST_DIR = PurePosixPath("/tmp")
+
 
 class _ServoCalibrationArgs(BaseModel):
     """Read calibration. Omit ``id`` for every servo."""
@@ -429,6 +444,9 @@ class _MixerSetArgs(BaseModel):
 class _VolumeArgs(BaseModel):
     percent: int = Field(ge=0, le=100)
     persist: bool = False
+    # False sets (and persists) the volume without touching mute, so a client
+    # saving its settings doesn't unmute the speaker.
+    unmute: bool = True
 
 
 class _MuteArgs(BaseModel):
@@ -889,7 +907,12 @@ async def setup(
             pcm = pcm[skip:]
 
         def _write_and_measure() -> dict:
-            with wave.open(args.path, "wb") as w:
+            # O_NOFOLLOW: /tmp is shared, and a link planted at the path must
+            # not turn this write into one somewhere else.
+            fd = os.open(
+                args.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+            )
+            with os.fdopen(fd, "wb") as fh, wave.open(fh, "wb") as w:
                 w.setnchannels(channels)
                 w.setsampwidth(width)
                 w.setframerate(rate)
@@ -1031,9 +1054,9 @@ async def setup(
 
     # ---- Volume ----
 
-    async def _apply_volume(percent: int, persist: bool) -> dict:
-        result = await audio_be.set_volume(percent, persist=persist)
-        await cyd.push_state(volume=result.get("volume"), muted=False)
+    async def _apply_volume(percent: int, persist: bool, unmute: bool) -> dict:
+        result = await audio_be.set_volume(percent, persist=persist, unmute=unmute)
+        await cyd.push_state(volume=result.get("volume"), muted=result.get("muted"))
         await bus.publish(
             Event(topic="audio.volume", source="host", data=dict(result))
         )
@@ -1044,9 +1067,9 @@ async def setup(
         """Set output volume, 0..100, where 100 is 0 dB.
 
         ``persist`` keeps it across a restart; without it the setting lasts
-        until the daemon stops.
+        until the daemon stops. ``unmute: false`` leaves mute as it is.
         """
-        return await _apply_volume(args.percent, args.persist)
+        return await _apply_volume(args.percent, args.persist, args.unmute)
 
     @dispatcher.verb("audio.volume.get", args_model=_EmptyArgs)
     async def _audio_volume_get(_args: _EmptyArgs) -> dict:
@@ -1096,8 +1119,18 @@ async def setup(
             except Exception:
                 log.warning("pre-%s: %s failed", action, what, exc_info=True)
 
-        await _try("stop flippers", servo_be.stop_all())
-        await _try("release holds", servo_be.release_hold())
+        # Through the stop verbs' path, so a running ramp is cancelled (it
+        # would otherwise drive the servo again) and each flipper publishes
+        # its state. Then cease every pulse train, as before.
+        for flipper in flippers.values():
+            await _try(f"stop flipper {flipper.id}", _stop_flipper(flipper))
+        await _try("stop servos", servo_be.stop_all())
+
+        async def _release_holds() -> None:
+            with motion.hold_stopped(None):
+                await servo_be.release_hold()
+
+        await _try("release holds", _release_holds())
         await _try("ring off", ring.set_mode("off"))
         # A dark screen says the robot is going down; a face still animating
         # through a shutdown looks like a crash. Not a mood: that would be
@@ -1117,7 +1150,20 @@ async def setup(
         if not allowed["allowed"]:
             return {"scheduled": False, **allowed}
         await _prepare_for_power_change(action)
-        return await power_ctl.request(action, delay_s)
+
+        async def _failed(reason: str) -> None:
+            # logind said no after the caller was told yes: the robot stays up.
+            # Light the screen again and tell every console it isn't going down.
+            await cyd.screen_on()
+            await bus.publish(
+                Event(
+                    topic=f"system.{action}",
+                    source="host",
+                    data={"scheduled": False, "failed": True, "reason": reason},
+                )
+            )
+
+        return await power_ctl.request(action, delay_s, on_failure=_failed)
 
     @dispatcher.verb("system.power_status", args_model=_EmptyArgs)
     async def _system_power_status(_args: _EmptyArgs) -> dict:

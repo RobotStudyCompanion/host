@@ -3,9 +3,11 @@
 Two-way UART link between the host daemon and the ESP32-driven CYD:
 
 * **Reader task** — consumes newline-delimited lines from the SerialBackend.
-  Lines starting with ``host_`` are classified into events tagged
-  ``source: cyd`` and published on the bus. Everything else is logged and
-  ignored (defensive against firmware chatter we don't yet handle).
+  Request lines (``host_vol``, ``host_mute``, …) and ``host_ready`` are
+  published on the bus as events tagged ``source: cyd``. Report lines
+  (``host_face``, ``host_cycle``, ``host_bright``, ``host_auto_bright``) only
+  update the screen state. Everything else is logged and ignored (defensive
+  against firmware chatter we don't yet handle).
 
 * **Writer** — accepts dotted verbs from the daemon side (``cyd.mood``,
   ``cyd.theme``, …), translates to the underscored serial grammar
@@ -91,8 +93,9 @@ _CYD_EVENT_MAP: dict[str, tuple[str, callable]] = {
     "host_poweroff":    ("host_poweroff",    _parse_empty),
     # The screen restarted; a full report follows.
     "host_ready":       ("host_ready",       _parse_empty),
-    # Reports: they only update the screen state. The host never writes to the
-    # screen in reply to one, or the two would chase each other.
+    # Reports: they only update the screen state, and are not published as
+    # events themselves. The host never writes to the screen in reply to one,
+    # or the two would chase each other.
     "host_face":        ("host_face",        _parse_face),
     "host_cycle":       ("host_cycle",       _parse_on_off),
     "host_bright":      ("host_bright",      _parse_percent),
@@ -181,6 +184,15 @@ _VALUE_CHECKS = {
 }
 
 
+#: The start-up probe (step 2b, agreed with the firmware): an empty line, a
+#: pause whose replies are ignored, then up to three ``vol?``. Each attempt's
+#: wait is short because the screen answers within milliseconds, and the
+#: daemon start-up, and every test rig, waits for all of them on old firmware.
+PROBE_ATTEMPTS = 3
+PROBE_SETTLE_S = 0.2
+PROBE_TIMEOUT_S = 0.5
+
+
 class CydBridge:
     """Bidirectional CYD link atop a :class:`SerialBackend`."""
 
@@ -259,7 +271,11 @@ class CydBridge:
                 log.info("CYD state push enabled (screen sent host_ready)")
             self._supports_push = True
 
-        await self._bus.publish(Event(topic=topic, source="cyd", data=data))
+        # Report lines are not published: a cycling screen sends a face every
+        # few seconds, which would fill the event history. cyd.state carries
+        # what they say, on a change.
+        if prefix not in _REPORT_FIELDS:
+            await self._bus.publish(Event(topic=topic, source="cyd", data=data))
 
         if prefix == "host_ready":
             await self._update_screen(reports=True)
@@ -304,38 +320,61 @@ class CydBridge:
     # gate this on a flag somebody has to remember to flip, the bridge asks the
     # firmware once at start and enables itself when the commands appear.
 
-    async def probe_push_support(self, timeout: float = 1.5) -> bool:
+    async def probe_push_support(
+        self,
+        *,
+        attempts: int = PROBE_ATTEMPTS,
+        timeout: float = PROBE_TIMEOUT_S,
+        settle: float = PROBE_SETTLE_S,
+    ) -> bool:
         """Ask the firmware whether it can be told about volume state.
 
-        Sends ``vol?``. Current firmware answers ``ERR: unknown command``;
-        patched firmware answers ``vol: NN``. Either way the daemon carries on
-        — a panel that cannot be updated is the situation we already have.
+        First an empty line: whatever half a line sits in the screen's buffer
+        (a byte from boot, a cable plugged in mid-line) is then ended and
+        answered on its own, and that answer is ignored for ``settle`` seconds.
+        Then ``vol?``. Only a reply starting ``vol:`` counts; ``ERR`` or no
+        reply is retried, ``attempts`` times in all, because a stray byte can
+        still garble one attempt. Old firmware answers ``ERR`` every time.
+        Either way the daemon carries on, and ``host_ready`` can still turn
+        push on later.
         """
-        loop = asyncio.get_running_loop()
-        self._probe_reply = loop.create_future()
-        try:
-            await self._backend.write_line("vol?")
-            reply = await asyncio.wait_for(self._probe_reply, timeout)
-        except (asyncio.TimeoutError, Exception) as exc:
-            self._supports_push = False
-            log.info(
-                "CYD state push disabled (no answer to 'vol?': %s). The panel "
-                "will show its own guess at volume and mute.",
-                type(exc).__name__,
-            )
-            return False
-        finally:
-            self._probe_reply = None
+        if not await self._write_quietly(("",)):
+            return self._probe_failed("serial write failed")
+        await asyncio.sleep(settle)
 
-        self._supports_push = reply.startswith("vol:")
-        if self._supports_push:
-            log.info("CYD state push enabled (firmware answered %r)", reply)
-        else:
-            log.info(
-                "CYD state push disabled (firmware lacks 'vol'); panel volume "
-                "and mute icons will drift from the host"
-            )
-        return self._supports_push
+        last = "no reply"
+        loop = asyncio.get_running_loop()
+        for attempt in range(1, attempts + 1):
+            self._probe_reply = loop.create_future()
+            try:
+                await self._backend.write_line("vol?")
+                reply = await asyncio.wait_for(self._probe_reply, timeout)
+            except asyncio.TimeoutError:
+                last = "no reply"
+                continue
+            except Exception as exc:
+                # The port itself is broken; asking again won't help.
+                return self._probe_failed(type(exc).__name__)
+            finally:
+                self._probe_reply = None
+            if reply.startswith("vol:"):
+                self._supports_push = True
+                log.info(
+                    "CYD state push enabled (firmware answered %r, attempt %d)",
+                    reply, attempt,
+                )
+                return True
+            last = reply
+        return self._probe_failed(f"{attempts} attempts, last: {last!r}")
+
+    def _probe_failed(self, why: str) -> bool:
+        self._supports_push = False
+        log.info(
+            "CYD state push disabled for now (%s). The panel shows its own "
+            "guess at volume and mute until it sends host_ready.",
+            why,
+        )
+        return False
 
     @property
     def supports_push(self) -> bool:
@@ -378,8 +417,13 @@ class CydBridge:
     # ``clear`` and ``led:off`` leave it as dark as it can go.
 
     async def screen_on(self) -> None:
-        """Wake the screen at start-up, in case a shutdown left it dark."""
-        await self._write_quietly(("screen:on",) if self._supports_push else ("resume",))
+        """Wake the screen, in case a shutdown left it dark.
+
+        Both lines, whatever the probe said: a probe garbled three times would
+        otherwise leave new firmware dark. Old firmware answers ``ERR`` to
+        ``screen:on``; new firmware takes ``resume`` as harmless.
+        """
+        await self._write_quietly(("screen:on", "resume"))
 
     async def screen_off(self) -> None:
         """Blank the screen before the machine goes down."""

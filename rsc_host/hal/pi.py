@@ -1639,23 +1639,30 @@ class PiAudioBackend(AudioBackend):
     def _index_to_percent(index: int) -> int:
         return max(0, min(100, round(index * 100 / PiAudioBackend.VOLUME_0DB)))
 
-    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
+    async def set_volume(
+        self, percent: int, *, persist: bool = False, unmute: bool = True
+    ) -> dict:
         """Set output volume as 0..100, where 100 is 0 dB.
 
         Unmutes if muted, because a user turning the volume up expects sound.
+        With ``unmute=False`` a muted output stays at 0 and only the setting
+        changes, which ``set_mute(False)`` later restores; a client saving its
+        settings must not unmute the speaker.
         """
         percent = max(0, min(100, int(percent)))
         index = self._percent_to_index(percent)
-        applied = [c for c in self.VOLUME_CONTROLS
-                   if await self._set_control(c, str(index))]
+        keep_muted = self._muted and not unmute
+        applied = [] if keep_muted else [
+            c for c in self.VOLUME_CONTROLS if await self._set_control(c, str(index))
+        ]
         self._volume = percent
-        self._muted = False
+        self._muted = keep_muted
         if persist:
             self._persist_audio_state()
         return {
             "volume": percent,
             "index": index,
-            "muted": False,
+            "muted": keep_muted,
             "controls": applied,
             "persisted": persist,
         }
