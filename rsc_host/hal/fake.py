@@ -547,12 +547,15 @@ class FakeAudio(AudioBackend):
             "preset_controls": len(applied),
         }
 
-    async def set_volume(self, percent: int, *, persist: bool = False) -> dict:
+    async def set_volume(
+        self, percent: int, *, persist: bool = False, unmute: bool = True
+    ) -> dict:
         self._volume = max(0, min(100, int(percent)))
-        self._muted = False
+        if unmute:
+            self._muted = False
         if persist and self._state and self._state.available:
             self._state.write("audio", {"volume": self._volume})
-        return {"volume": self._volume, "muted": False, "persisted": persist}
+        return {"volume": self._volume, "muted": self._muted, "persisted": persist}
 
     async def get_volume(self) -> dict:
         return {"volume": self._volume, "muted": self._muted}
@@ -563,6 +566,9 @@ class FakeAudio(AudioBackend):
 
     async def set_mic_mute(self, muted: bool) -> dict:
         self._mic_muted = bool(muted)
+        return {"mic_muted": self._mic_muted}
+
+    async def get_mic_mute(self) -> dict:
         return {"mic_muted": self._mic_muted}
 
     async def _restore_audio_state(self) -> None:

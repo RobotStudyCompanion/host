@@ -28,6 +28,59 @@ async def rig():
         await peripherals.stop()
 
 
+#: What setup() writes when the screen never answers ``vol:``.
+OLD_FIRMWARE_STARTUP = ("", "vol?", "vol?", "vol?", "screen:on", "resume", "report")
+
+
+class TestStartupPush:
+    """The panel keeps no copy of volume or mute, so it must be told at boot."""
+
+    @staticmethod
+    def _panel_answers(monkeypatch, reply: str) -> None:
+        from rsc_host.hal.fake import FakeSerial
+
+        original = FakeSerial.write_line
+
+        async def write_line(self, line: str) -> None:
+            await original(self, line)
+            if line == "vol?":
+                await self.inject(reply)
+
+        monkeypatch.setattr(FakeSerial, "write_line", write_line)
+
+    async def test_pushes_state_when_firmware_supports_it(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from rsc_host.state import StateStore
+
+        self._panel_answers(monkeypatch, "vol:            50")
+        store = StateStore(tmp_path)
+        store.write("audio", {"volume": 40})
+        peripherals = await setup(Dispatcher(), EventBus(), backend="fake", state=store)
+        try:
+            written = peripherals.serial_backend.written()
+            assert written == (
+                "", "vol?", "vol:40", "mute:off", "mic_mute:off",
+                "screen:on", "resume", "report",
+            )
+        finally:
+            await peripherals.stop()
+
+    async def test_pushes_nothing_when_firmware_lacks_the_commands(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from rsc_host.state import StateStore
+
+        self._panel_answers(monkeypatch, "ERR: unknown command 'vol'")
+        peripherals = await setup(
+            Dispatcher(), EventBus(), backend="fake", state=StateStore(tmp_path)
+        )
+        try:
+            assert peripherals.serial_backend.written() == OLD_FIRMWARE_STARTUP
+        finally:
+            await peripherals.stop()
+
+
 class TestVerbRegistration:
     async def test_flipper_verbs_registered(self, rig) -> None:
         dispatcher, _, _ = rig
@@ -84,11 +137,8 @@ class TestEndToEnd:
             Cmd(id="c3", verb="cyd.mood", args={"value": "HAPPY"})
         )
         assert ack.ok is True
-        # Setup also sends the "vol?" capability probe; ignore it here.
-        written = [
-            line for line in peripherals.serial_backend.written() if line != "vol?"
-        ]
-        assert written == ["mood:HAPPY"]
+        # Start-up lines (probe, wake, report) come first; the verb's is last.
+        assert peripherals.serial_backend.written()[-1] == "mood:HAPPY"
 
     async def test_button_edge_fires_event(self, rig) -> None:
         _, bus, peripherals = rig
@@ -227,3 +277,513 @@ class TestBadParamsOnTheWire:
                              '"args":{"mode":"on","params":{"duty":NaN}}}')
         ack = await dispatcher.dispatch(Cmd.model_validate(payload))
         assert ack.code == "INVALID_ARGS"
+
+
+# ---- Step 2: screen sync through setup() ----
+
+
+async def _quiet(q, timeout: float = 0.2) -> list:
+    """Everything published within ``timeout``."""
+    seen = []
+    try:
+        while True:
+            seen.append(await asyncio.wait_for(q.get(), timeout=timeout))
+    except asyncio.TimeoutError:
+        return seen
+
+
+@pytest.fixture
+async def old_fw(tmp_path):
+    """A rig whose screen never answers the probe (unplugged or old firmware)."""
+    dispatcher, bus = Dispatcher(), EventBus()
+    peripherals = await setup(
+        dispatcher, bus, backend="fake", state=StateStore(tmp_path)
+    )
+    try:
+        yield dispatcher, bus, peripherals
+    finally:
+        await peripherals.stop()
+
+
+@pytest.fixture
+async def new_fw(monkeypatch, tmp_path):
+    """A rig whose screen answers ``vol?`` like the new firmware."""
+    TestStartupPush._panel_answers(monkeypatch, "vol:   50")
+    dispatcher, bus = Dispatcher(), EventBus()
+    peripherals = await setup(
+        dispatcher, bus, backend="fake", state=StateStore(tmp_path)
+    )
+    try:
+        yield dispatcher, bus, peripherals
+    finally:
+        await peripherals.stop()
+
+
+class TestScreenSync:
+    async def test_startup_without_answer_is_old_firmware(self, old_fw) -> None:
+        _, _, peripherals = old_fw
+        assert peripherals.serial_backend.written() == OLD_FIRMWARE_STARTUP
+
+    async def test_mood_verb_writes_and_publishes_state(self, old_fw) -> None:
+        dispatcher, bus, peripherals = old_fw
+        serial = peripherals.serial_backend
+        before = len(serial.written())
+        async with bus.subscribe() as q:
+            ack = await dispatcher.dispatch(
+                Cmd(id="m1", verb="cyd.mood", args={"value": "happy"})
+            )
+            assert ack.ok is True
+            assert ack.result == {"verb": "cyd.mood", "value": "HAPPY"}
+            evt = await asyncio.wait_for(q.get(), timeout=1.0)
+            assert evt.topic == "cyd.state" and evt.source == "host"
+            assert evt.data == {
+                "mood": "HAPPY", "cycle": None, "bright": None,
+                "auto_bright": None, "reports": False,
+            }
+            await serial.inject("host_face:HAPPY")
+            later = await _quiet(q)
+        assert serial.written()[before:] == ("mood:HAPPY",)
+        # Only the reports flag; no second mood change, no host_face event.
+        assert [e.topic for e in later] == ["cyd.state"]
+        assert later[0].data == {**evt.data, "reports": True}
+
+    async def test_bad_value_is_invalid_args(self, old_fw) -> None:
+        # One rig for every case: each setup() costs over a second.
+        dispatcher, _, peripherals = old_fw
+        before = peripherals.serial_backend.written()
+        for verb, args in [
+            ("cyd.mood", {"value": "SMILE"}),
+            ("cyd.mood", {}),
+            ("cyd.mood_cycle", {"value": "maybe"}),
+            ("cyd.bright", {"value": "0"}),
+            ("cyd.bright", {"value": "abc"}),
+        ]:
+            ack = await dispatcher.dispatch(Cmd(id="m2", verb=verb, args=args))
+            assert ack.ok is False, (verb, args)
+            assert ack.code == "INVALID_ARGS", (verb, args)
+        assert peripherals.serial_backend.written() == before
+        assert peripherals.cyd.snapshot()["mood"] is None
+
+    async def test_report_lines_never_write(self, old_fw) -> None:
+        _, bus, peripherals = old_fw
+        serial = peripherals.serial_backend
+        before = serial.written()
+        async with bus.subscribe() as q:
+            await serial.inject_many(
+                ["host_face:SAD", "host_cycle:on", "host_bright:30",
+                 "host_auto_bright:on", "host_bright:abc"]
+            )
+            await _quiet(q)
+        assert serial.written() == before
+
+    async def test_host_ready_after_failed_probe_pushes_audio(self, old_fw) -> None:
+        dispatcher, bus, peripherals = old_fw
+        serial = peripherals.serial_backend
+        await dispatcher.dispatch(Cmd(id="v", verb="audio.volume", args={"percent": 35}))
+        before = len(serial.written())
+        assert peripherals.cyd.supports_push is False
+        async with bus.subscribe() as q:
+            await serial.inject("host_ready")
+            events = await _quiet(q)
+        assert peripherals.cyd.supports_push is True
+        assert serial.written()[before:] == ("vol:35", "mute:off", "mic_mute:off")
+        # No audio event: nothing changed on the host.
+        assert not [e for e in events if e.topic.startswith("audio.")]
+
+    async def test_status_carries_state(self, old_fw) -> None:
+        dispatcher, _, _ = old_fw
+        await dispatcher.dispatch(
+            Cmd(id="b", verb="cyd.bright", args={"value": "40"})
+        )
+        ack = await dispatcher.dispatch(
+            Cmd(id="s", verb="peripherals.status", args={})
+        )
+        cyd = ack.result["cyd"]
+        assert cyd["reports"] is False
+        assert cyd["state"] == {
+            "mood": None, "cycle": None, "bright": 40,
+            "auto_bright": False, "reports": False,
+        }
+
+    async def test_mic_toggle_reads_the_backend(self, old_fw) -> None:
+        dispatcher, bus, peripherals = old_fw
+        await dispatcher.dispatch(
+            Cmd(id="mm", verb="audio.mic_mute", args={"muted": True})
+        )
+        async with bus.subscribe() as q:
+            await peripherals.serial_backend.inject("host_mic")
+            events = await _quiet(q)
+        mic = [e for e in events if e.topic == "audio.mic_mute"]
+        assert mic and mic[0].data["mic_muted"] is False
+
+
+class TestPower:
+    """B17: ask first; a refusal changes nothing."""
+
+    @staticmethod
+    def _logind(monkeypatch, peripherals, allowed: bool) -> list[str]:
+        """Stand in for logind on this rig's power backend."""
+        requested: list[str] = []
+
+        async def status() -> dict:
+            if allowed:
+                return {"can_power_off": "yes", "can_reboot": "yes", "allowed": True}
+            return {
+                "can_power_off": "challenge", "can_reboot": "challenge",
+                "allowed": False, "reason": "polkit says no",
+            }
+
+        async def request(action: str, delay: float = 2.0, on_failure=None) -> dict:
+            requested.append(action)
+            return {"scheduled": True, "action": action, "delay_s": delay}
+
+        monkeypatch.setattr(peripherals.power, "status", status)
+        monkeypatch.setattr(peripherals.power, "request", request)
+        return requested
+
+    @staticmethod
+    async def _moving(dispatcher) -> None:
+        await dispatcher.dispatch(
+            Cmd(id="f", verb="flipper.left", args={"speed": 0.5})
+        )
+        await dispatcher.dispatch(
+            Cmd(id="r", verb="ring.mode",
+                args={"mode": "solid", "params": {"color": "#00ff00"}})
+        )
+
+    async def _assert_untouched(self, peripherals, written_before) -> None:
+        assert await peripherals.servo_backend.get_speed("left") == 0.5
+        assert peripherals.ring.current_mode == "solid"
+        assert peripherals.serial_backend.written() == written_before
+
+    async def test_refused_verb_changes_nothing(self, old_fw, monkeypatch) -> None:
+        dispatcher, bus, peripherals = old_fw
+        requested = self._logind(monkeypatch, peripherals, allowed=False)
+        await self._moving(dispatcher)
+        before = peripherals.serial_backend.written()
+        async with bus.subscribe() as q:
+            for verb in ("system.poweroff", "system.reboot"):
+                ack = await dispatcher.dispatch(
+                    Cmd(id=verb, verb=verb, args={"confirm": True})
+                )
+                assert ack.ok is True
+                assert ack.result["scheduled"] is False
+                assert ack.result["reason"] == "polkit says no"
+            events = await _quiet(q)
+        assert not [e for e in events if e.topic.startswith("system.")]
+        assert requested == []
+        await self._assert_untouched(peripherals, before)
+
+    async def test_refused_panel_changes_nothing(self, old_fw, monkeypatch) -> None:
+        dispatcher, bus, peripherals = old_fw
+        requested = self._logind(monkeypatch, peripherals, allowed=False)
+        await self._moving(dispatcher)
+        before = peripherals.serial_backend.written()
+        async with bus.subscribe() as q:
+            await peripherals.serial_backend.inject_many(
+                ["host_poweroff", "host_reboot"]
+            )
+            events = await _quiet(q)
+        assert [e.topic for e in events] == ["host_poweroff", "host_reboot"]
+        assert requested == []
+        await self._assert_untouched(peripherals, before)
+
+    async def test_allowed_verb_blanks_old_screen(self, old_fw, monkeypatch) -> None:
+        dispatcher, bus, peripherals = old_fw
+        requested = self._logind(monkeypatch, peripherals, allowed=True)
+        await self._moving(dispatcher)
+        before = len(peripherals.serial_backend.written())
+        async with bus.subscribe() as q:
+            ack = await dispatcher.dispatch(
+                Cmd(id="p", verb="system.poweroff", args={"confirm": True})
+            )
+            events = await _quiet(q)
+        assert ack.result["scheduled"] is True
+        assert requested == ["poweroff"]
+        assert peripherals.serial_backend.written()[before:] == (
+            "pause", "clear", "led:off",
+        )
+        assert await peripherals.servo_backend.get_speed("left") == 0.0
+        pending = [e for e in events if e.topic == "system.poweroff"]
+        assert [e.data for e in pending] == [{"pending": True}]
+
+    async def test_allowed_panel_blanks_new_screen(self, new_fw, monkeypatch) -> None:
+        _, bus, peripherals = new_fw
+        requested = self._logind(monkeypatch, peripherals, allowed=True)
+        before = len(peripherals.serial_backend.written())
+        async with bus.subscribe() as q:
+            await peripherals.serial_backend.inject("host_reboot")
+            events = await _quiet(q)
+        assert requested == ["reboot"]
+        assert peripherals.serial_backend.written()[before:] == ("screen:off",)
+        reboot = [e.data for e in events if e.topic == "system.reboot"]
+        assert reboot[0] == {"pending": True}
+
+
+class TestFakePower:
+    """On the fake backend, power is simulated: busctl is never called."""
+
+    @staticmethod
+    def _no_busctl(monkeypatch) -> None:
+        from rsc_host import power
+
+        async def _busctl(*args, **kwargs):
+            pytest.fail(f"fake backend called busctl {args}")
+
+        monkeypatch.setattr(power, "_busctl", _busctl)
+
+    async def test_setup_picks_by_backend(self, old_fw) -> None:
+        from rsc_host import power
+
+        _, _, peripherals = old_fw
+        assert isinstance(peripherals.power, power.FakePower)
+
+    async def test_verbs_and_panel_never_call_busctl(
+        self, old_fw, monkeypatch, caplog
+    ) -> None:
+        dispatcher, bus, peripherals = old_fw
+        self._no_busctl(monkeypatch)
+
+        ack = await dispatcher.dispatch(
+            Cmd(id="s", verb="system.power_status", args={})
+        )
+        assert ack.ok is True
+        assert ack.result == {
+            "can_power_off": "yes", "can_reboot": "yes", "allowed": True,
+        }
+        ack = await dispatcher.dispatch(
+            Cmd(id="p", verb="system.poweroff", args={"confirm": True, "delay_s": 0})
+        )
+        assert ack.ok is True
+        assert ack.result == {"scheduled": True, "action": "poweroff", "delay_s": 0.0}
+        ack = await dispatcher.dispatch(
+            Cmd(id="r", verb="system.reboot", args={"confirm": True})
+        )
+        assert ack.result == {"scheduled": True, "action": "reboot", "delay_s": 2.0}
+
+        async with bus.subscribe() as q:
+            await peripherals.serial_backend.inject("host_poweroff")
+            events = await _quiet(q)
+        assert [e.data for e in events if e.topic == "system.poweroff"][0] == {
+            "pending": True
+        }
+        # Give any stray background task a chance to reach busctl.
+        await asyncio.sleep(0.05)
+        assert "fake backend: would power off" in caplog.text
+        assert "fake backend: would reboot" in caplog.text
+
+    async def test_fake_power_alone(self, monkeypatch) -> None:
+        from rsc_host import power
+
+        self._no_busctl(monkeypatch)
+        fake = power.FakePower()
+        assert (await fake.status())["allowed"] is True
+        assert (await fake.request("reboot", 0.0))["scheduled"] is True
+        with pytest.raises(ValueError):
+            await fake.request("hibernate")
+
+    async def test_real_backend_still_asks_logind(self, monkeypatch) -> None:
+        from rsc_host import power
+
+        calls: list[tuple] = []
+
+        async def _busctl(*args, **kwargs):
+            calls.append(args)
+            return 0, 's "challenge"'
+
+        monkeypatch.setattr(power, "_busctl", _busctl)
+        monkeypatch.setattr(power.shutil, "which", lambda name: "/usr/bin/busctl")
+        real = power.LogindPower()
+        status = await real.status()
+        assert status["allowed"] is False
+        result = await real.request("poweroff", 0.0)
+        assert result["scheduled"] is False
+        methods = {args[-1] for args in calls}
+        assert methods == {"CanPowerOff", "CanReboot"}
+
+
+# ---- Step 2b ----
+
+
+class TestStartupProbe:
+    async def test_stray_err_then_vol_is_new_firmware(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from rsc_host.hal.fake import FakeSerial
+
+        replies = ["ERR: unknown command 'xvol'", "vol:   50"]
+        original = FakeSerial.write_line
+
+        async def write_line(self, line: str) -> None:
+            await original(self, line)
+            if line == "vol?" and replies:
+                await self.inject(replies.pop(0))
+
+        monkeypatch.setattr(FakeSerial, "write_line", write_line)
+        peripherals = await setup(
+            Dispatcher(), EventBus(), backend="fake", state=StateStore(tmp_path)
+        )
+        try:
+            assert peripherals.cyd.supports_push is True
+            assert peripherals.serial_backend.written() == (
+                "", "vol?", "vol?", "vol:100", "mute:off", "mic_mute:off",
+                "screen:on", "resume", "report",
+            )
+        finally:
+            await peripherals.stop()
+
+
+class TestPowerDuringRamp:
+    async def test_poweroff_cancels_the_ramp(self, old_fw) -> None:
+        dispatcher, bus, peripherals = old_fw
+        await dispatcher.dispatch(
+            Cmd(id="f", verb="flipper.left", args={"speed": 1.0, "ramp_ms": 3000})
+        )
+        await asyncio.sleep(0.2)
+        assert 0.0 < peripherals.flipper_left.current_speed < 1.0
+        async with bus.subscribe() as q:
+            ack = await dispatcher.dispatch(
+                Cmd(id="p", verb="system.poweroff", args={"confirm": True})
+            )
+            assert ack.result["scheduled"] is True
+            await asyncio.sleep(1.0)
+            events = await _quiet(q, timeout=0.05)
+        assert await peripherals.servo_backend.get_speed("left") == 0.0
+        assert peripherals.flipper_left.current_speed == 0.0
+        left = [e.data["speed"] for e in events if e.topic == "flipper.left.state"]
+        assert left == [0.0]
+
+
+class TestLogindFailure:
+    """Step 2b, H3: logind refuses after the caller was told yes."""
+
+    @staticmethod
+    def _logind(monkeypatch, power_off_reply: tuple[int, str]) -> list[tuple]:
+        from rsc_host import power
+
+        calls: list[tuple] = []
+
+        async def _busctl(*args, **kwargs):
+            calls.append(args)
+            if args[-1] in ("CanPowerOff", "CanReboot"):
+                return 0, 's "yes"'
+            return power_off_reply
+
+        monkeypatch.setattr(power, "_busctl", _busctl)
+        monkeypatch.setattr(power.shutil, "which", lambda name: "/usr/bin/busctl")
+        return calls
+
+    async def test_request_calls_on_failure(self, monkeypatch) -> None:
+        from rsc_host import power
+
+        self._logind(monkeypatch, (1, "Access denied"))
+        reasons: list[str] = []
+        done = asyncio.Event()
+
+        async def on_failure(reason: str) -> None:
+            reasons.append(reason)
+            done.set()
+
+        result = await power.LogindPower().request("poweroff", 0.0, on_failure)
+        assert result["scheduled"] is True
+        await asyncio.wait_for(done.wait(), 1.0)
+        assert "Access denied" in reasons[0]
+
+    async def test_success_does_not_call_on_failure(self, monkeypatch) -> None:
+        from rsc_host import power
+
+        calls = self._logind(monkeypatch, (0, ""))
+        reasons: list[str] = []
+
+        async def on_failure(reason: str) -> None:
+            reasons.append(reason)
+
+        await power.request("reboot", 0.0, on_failure)
+        await asyncio.sleep(0.05)
+        assert ("call", power._BUS, power._PATH, power._IFACE, "Reboot", "b", "false") in calls
+        assert reasons == []
+
+    async def test_robot_wakes_screen_and_says_so(self, old_fw, monkeypatch) -> None:
+        from rsc_host import power
+
+        dispatcher, bus, peripherals = old_fw
+        self._logind(monkeypatch, (1, "Access denied"))
+        real = power.LogindPower()
+        monkeypatch.setattr(peripherals.power, "status", real.status)
+        monkeypatch.setattr(peripherals.power, "request", real.request)
+        before = len(peripherals.serial_backend.written())
+        async with bus.subscribe() as q:
+            ack = await dispatcher.dispatch(
+                Cmd(id="p", verb="system.poweroff",
+                    args={"confirm": True, "delay_s": 0})
+            )
+            assert ack.result["scheduled"] is True
+            events = await _quiet(q)
+        system = [e.data for e in events if e.topic == "system.poweroff"]
+        assert system[0] == {"pending": True}
+        assert system[1]["scheduled"] is False
+        assert system[1]["failed"] is True
+        assert "Access denied" in system[1]["reason"]
+        assert peripherals.serial_backend.written()[before:] == (
+            "pause", "clear", "led:off", "screen:on", "resume",
+        )
+
+
+class TestVolumeUnmute:
+    async def test_unmute_false_keeps_mute_and_default_unmutes(self, old_fw) -> None:
+        dispatcher, bus, peripherals = old_fw
+        await dispatcher.dispatch(Cmd(id="m", verb="audio.mute", args={"muted": True}))
+        async with bus.subscribe() as q:
+            ack = await dispatcher.dispatch(
+                Cmd(id="v", verb="audio.volume",
+                    args={"percent": 30, "persist": True, "unmute": False})
+            )
+            events = await _quiet(q)
+        assert ack.ok is True
+        assert ack.result["volume"] == 30 and ack.result["muted"] is True
+        assert [e.data["muted"] for e in events if e.topic == "audio.volume"] == [True]
+        assert await peripherals.audio_backend.get_volume() == {
+            "volume": 30, "muted": True,
+        }
+        ack = await dispatcher.dispatch(
+            Cmd(id="v2", verb="audio.volume", args={"percent": 40})
+        )
+        assert ack.result["muted"] is False
+        assert (await peripherals.audio_backend.get_volume())["muted"] is False
+
+    async def test_pi_backend_leaves_the_mixer_alone_while_muted(self) -> None:
+        from rsc_host.hal.pi import PiAudioBackend
+
+        backend = PiAudioBackend()
+        written: list[tuple[str, str]] = []
+
+        async def _set_control(name: str, value: str) -> bool:
+            written.append((name, value))
+            return True
+
+        backend._set_control = _set_control
+        await backend.set_mute(True)
+        written.clear()
+        result = await backend.set_volume(30, unmute=False)
+        assert result["muted"] is True and result["controls"] == []
+        assert written == []
+        assert (await backend.get_volume())["volume"] == 30
+        result = await backend.set_volume(30)
+        assert result["muted"] is False and written
+
+
+class TestSelftestPath:
+    async def test_paths_outside_tmp_rejected(self, old_fw) -> None:
+        dispatcher, _, _ = old_fw
+        for path in ("/etc/x.wav", "/tmp/a/b.wav", "/tmp/x.txt", "/tmp/../etc/x.wav"):
+            ack = await dispatcher.dispatch(
+                Cmd(id="t", verb="audio.selftest", args={"path": path})
+            )
+            assert ack.ok is False, path
+            assert ack.code == "INVALID_ARGS", path
+
+    def test_default_and_plain_tmp_wav_accepted(self) -> None:
+        from rsc_host.peripherals.registry import _AudioSelftestArgs
+
+        assert _AudioSelftestArgs().path == "/tmp/rsc_selftest.wav"
+        assert _AudioSelftestArgs(path="/tmp/mine.wav").path == "/tmp/mine.wav"

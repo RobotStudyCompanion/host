@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from collections.abc import Awaitable, Callable
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,10 @@ _IFACE = "org.freedesktop.login1.Manager"
 #: button sees a dropped connection and no confirmation — indistinguishable
 #: from a crash.
 DEFAULT_DELAY = 2.0
+
+#: Called with a reason when logind refuses a request the caller was already
+#: told had been scheduled.
+OnFailure = Callable[[str], Awaitable[None]]
 
 
 async def _busctl(*args: str, timeout: float = 5.0) -> tuple[int, str]:
@@ -98,22 +103,38 @@ async def status() -> dict:
     return result
 
 
-async def _invoke(method: str, delay: float) -> None:
+async def _invoke(
+    method: str, delay: float, on_failure: OnFailure | None = None
+) -> None:
     await asyncio.sleep(delay)
-    code, out = await _busctl("call", _BUS, _PATH, _IFACE, method, "b", "false")
-    if code != 0:
-        # Nothing useful to raise to: the caller was answered seconds ago and
-        # the console may already be gone. The journal is the only reader left.
-        log.error("%s refused by logind: %s", method, out)
-    else:
+    try:
+        code, out = await _busctl("call", _BUS, _PATH, _IFACE, method, "b", "false")
+    except Exception as exc:
+        code, out = 1, f"{type(exc).__name__}: {exc}"
+    if code == 0:
         log.info("%s accepted by logind", method)
+        return
+    # The caller was answered seconds ago and the robot is staying up, with the
+    # hardware already made safe for a shutdown that isn't coming.
+    log.error("%s refused by logind: %s", method, out)
+    if on_failure is not None:
+        try:
+            await on_failure(f"logind refused {method}: {out}")
+        except Exception:
+            log.exception("handling the failed %s failed too", method)
 
 
-async def request(action: str, delay: float = DEFAULT_DELAY) -> dict:
+_pending: set[asyncio.Task[None]] = set()
+
+
+async def request(
+    action: str, delay: float = DEFAULT_DELAY, on_failure: OnFailure | None = None
+) -> dict:
     """Ask logind to power off or reboot, after ``delay`` seconds.
 
     Returns as soon as the request is scheduled, so the caller gets an answer
-    while the network is still up. The actual call happens in a background task.
+    while the network is still up. The actual call happens in a background
+    task; if logind refuses it then, ``on_failure`` is awaited with a reason.
     """
     if action not in ("poweroff", "reboot"):
         raise ValueError(f"unknown power action: {action!r}")
@@ -123,6 +144,59 @@ async def request(action: str, delay: float = DEFAULT_DELAY) -> dict:
         return {"scheduled": False, **state}
 
     method = "PowerOff" if action == "poweroff" else "Reboot"
-    asyncio.create_task(_invoke(method, delay), name=f"power-{action}")
+    task = asyncio.create_task(
+        _invoke(method, delay, on_failure), name=f"power-{action}"
+    )
+    # Held until done: the event loop keeps only weak references to tasks.
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
     log.warning("%s requested; going down in %.1f s", action, delay)
     return {"scheduled": True, "action": action, "delay_s": delay}
+
+# ---- Backends ----
+#
+# setup() picks one by backend, as it does for the hardware. A laptop running
+# the fake backend must never ask logind to power off the laptop: with a
+# permissive polkit setup it would.
+
+
+class LogindPower:
+    """The real thing: asks logind through ``busctl``."""
+
+    async def status(self) -> dict:
+        return await status()
+
+    async def request(
+        self,
+        action: str,
+        delay: float = DEFAULT_DELAY,
+        on_failure: OnFailure | None = None,
+    ) -> dict:
+        return await request(action, delay, on_failure)
+
+
+class FakePower:
+    """Always allowed, never acts. Logs what it would have done.
+
+    Gives the same replies as :class:`LogindPower` when logind says yes, so a
+    console can run the whole shutdown flow against a laptop.
+    """
+
+    async def status(self) -> dict:
+        return {"can_power_off": "yes", "can_reboot": "yes", "allowed": True}
+
+    async def request(
+        self,
+        action: str,
+        delay: float = DEFAULT_DELAY,
+        on_failure: OnFailure | None = None,
+    ) -> dict:
+        """``on_failure`` is accepted and never called: the fake never fails."""
+        if action not in ("poweroff", "reboot"):
+            raise ValueError(f"unknown power action: {action!r}")
+        log.warning(
+            "fake backend: would %s in %.1f s",
+            "power off" if action == "poweroff" else "reboot",
+            delay,
+        )
+        return {"scheduled": True, "action": action, "delay_s": delay}

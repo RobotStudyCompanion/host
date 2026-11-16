@@ -129,3 +129,52 @@ class TestDisabled:
         finally:
             await flipper.stop()
             await backend.stop()
+
+
+class _FailsOnce(FakeServo):
+    """Raises on the ``n``-th set_speed call, then works again."""
+
+    def __init__(self, n: int, *, forever: bool = False) -> None:
+        super().__init__()
+        self._n = n
+        self._forever = forever
+        self.calls = 0
+
+    async def set_speed(self, servo_id: str, speed: float) -> None:
+        self.calls += 1
+        if self.calls == self._n or (self._forever and self.calls > self._n):
+            raise OSError("servo bus fell over")
+        await super().set_speed(servo_id, speed)
+
+
+class TestRampFailure:
+    """Step 2b, H4: a ramp that dies part-way must not leave the servo turning."""
+
+    async def _ramp_and_settle(self, backend) -> tuple[Flipper, list]:
+        await backend.start()
+        bus = EventBus()
+        flipper = Flipper("left", backend, bus)
+        async with bus.subscribe() as q:
+            await flipper.set_speed(1.0, ramp_ms=300)
+            await asyncio.sleep(0.6)
+            events = []
+            while not q.empty():
+                events.append(q.get_nowait())
+        return flipper, events
+
+    async def test_backend_error_mid_ramp_ends_at_zero(self, caplog) -> None:
+        backend = _FailsOnce(10)
+        flipper, events = await self._ramp_and_settle(backend)
+        assert await backend.get_speed("left") == 0.0
+        assert flipper.current_speed == 0.0
+        assert events[-1].data["speed"] == 0.0
+        assert "ramp failed" in caplog.text
+        # The ramp stopped at the failure rather than carrying on to 1.0.
+        assert backend.calls == 11
+
+    async def test_backend_that_stays_broken_still_publishes(self) -> None:
+        backend = _FailsOnce(10, forever=True)
+        flipper, events = await self._ramp_and_settle(backend)
+        # Nothing reached the hardware, but the state says what was attempted.
+        assert flipper.current_speed == 0.0
+        assert events[-1].data["speed"] == 0.0

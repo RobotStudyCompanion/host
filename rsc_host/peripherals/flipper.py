@@ -149,14 +149,27 @@ class Flipper:
             # Preempted by a new set_speed — the new call will apply its
             # own target. Don't emit a final event here; the new call will.
             raise
+        except Exception:
+            # Nobody awaits this task, so an error here would otherwise leave
+            # the servo turning at the last speed that reached it, with no
+            # event and no owner expecting it. Stop it and say so.
+            log.exception("flipper %s: ramp failed; stopping", self.id)
+            try:
+                await self._apply(0.0)
+            except Exception:
+                log.exception("flipper %s: stop after a failed ramp failed", self.id)
+                await self._publish_state()
 
     async def _apply(self, speed: float, *, publish: bool = True) -> None:
         """Write speed to the HAL (if enabled) and optionally publish an event."""
         self._current_speed = speed
         if self._enabled:
             await self._backend.set_speed(self.id, speed)
-        if not publish:
-            return
+        if publish:
+            await self._publish_state()
+
+    async def _publish_state(self) -> None:
+        speed = self._current_speed
         await self._bus.publish(
             Event(
                 topic=f"flipper.{self.id}.state",

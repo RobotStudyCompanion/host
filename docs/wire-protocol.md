@@ -143,7 +143,9 @@ Unknown codes should be treated as `INTERNAL_ERROR` for forward compatibility.
   "ring": {"available": true, "mode": "helper", "current_mode": "off", ...},
   "button_led": {"mode": "off"},
   "state": {"available": true, "directory": "/var/lib/rsc-host", "keys": ["servo"]},
-  "cyd": {"available": true, "state_push": false},
+  "cyd": {"available": true, "state_push": false, "reports": false,
+          "state": {"mood": null, "cycle": null, "bright": null,
+                    "auto_bright": null, "reports": false}},
   "audio": {"capturing": false, "playing": false, "capture": {...}},
   "pinout": {...}
 }
@@ -151,6 +153,8 @@ Unknown codes should be treated as `INTERNAL_ERROR` for forward compatibility.
 
 `backend` distinguishes a real robot from `"fake"`. `ring.available` and
 `cyd.available` tell you which peripherals are actually present.
+`cyd.state` is the same object as the latest `cyd.state` event, so a console
+opened later can catch up; `cyd.reports` repeats its `reports` field.
 `state.available` false means settings will not survive a restart.
 
 ### Flippers
@@ -283,7 +287,27 @@ error. Fields not listed here are ignored.
 | `cyd.mood` / `theme` / `bright` / `eye_colour` / `bg_colour` / `led` / `blink` / `splash` / `face` / `look` / `mood_cycle` | `{"value"?: string}` | `{"verb", "value"}` |
 | `cyd.raw` | `{"line": string}` | `{"line"}` |
 
-`cyd.raw` is the escape hatch, sent verbatim over UART.
+`cyd.raw` is the escape hatch, sent verbatim over UART. It is not tracked in
+`cyd.state`.
+
+Checked before anything goes to the screen; anything else is `INVALID_ARGS`
+and nothing is written:
+
+| Verb | Accepts | Sent as |
+|---|---|---|
+| `cyd.mood` | `NEUTRAL`, `HAPPY`, `ANGRY`, `SAD`, `EXCITED`, `ANNOYED`, `QUESTIONING`, `IDLE1`, `IDLE2`, `IDLE3`, any case | upper case |
+| `cyd.mood_cycle` | `on`, `off`, any case | lower case |
+| `cyd.bright` | whole number 1..100 | `bright:NN` |
+
+The result's `value` is what was sent, so `"happy"` comes back as `"HAPPY"`.
+The other curated verbs pass their value through, and the firmware answers
+`ERR` for a bad one.
+
+Sending `mood`, `mood_cycle`, `bright` or `face` records the value in
+`cyd.state` at once, so every console agrees even with firmware that never
+reports. `bright` also records `auto_bright: false`, as the firmware turns it
+off. `face` records the mood as `CUSTOM`. A report line from the screen
+overrides any of these.
 
 All return `PERIPHERAL_UNAVAILABLE` without `pyserial-asyncio` or a panel.
 
@@ -297,7 +321,10 @@ All return `PERIPHERAL_UNAVAILABLE` without `pyserial-asyncio` or a panel.
 | `audio.devices` |, | Card list and PCM names |
 | `audio.selftest` | `{"seconds"?: 0.5..30, "playback"?, "path"?, "normalise"?, "target_dbfs"?: -40..0, "settle_ms"?: 0..2000}` | See below |
 
-`audio.selftest` records, measures, writes a WAV, and optionally plays it back:
+`audio.selftest` records, measures, writes a WAV, and optionally plays it back.
+`path` must be a `.wav` file directly inside `/tmp` (default
+`/tmp/rsc_selftest.wav`); anything else is `INVALID_ARGS`. A symlink at the
+path is not followed.
 
 ```json
 {"path": "/tmp/rsc_selftest.wav", "bytes": 287040, "seconds": 2.99,
@@ -353,7 +380,7 @@ lifts both equally.
 
 | Verb | Args | Result |
 |---|---|---|
-| `audio.volume` | `{"percent": 0..100, "persist"?}` | `{"volume", "index", "muted", "controls", "persisted"}` |
+| `audio.volume` | `{"percent": 0..100, "persist"?, "unmute"?: bool}` | `{"volume", "index", "muted", "controls", "persisted"}` |
 | `audio.volume.get` |, | `{"volume", "muted", "index"}` |
 | `audio.mute` | `{"muted": bool}` | `{"muted", "volume"}` |
 | `audio.mic_mute` | `{"muted": bool}` | `{"mic_muted", "controls"}` |
@@ -367,6 +394,13 @@ something a software fault can bypass.
 Volume persists on request; **mute never does.** A robot that booted silent
 with no visible cause looks broken to anyone without a shell.
 
+`audio.volume` unmutes by default (`unmute` defaults to `true`), because
+someone turning the volume up expects sound. With `unmute: false` the volume is
+set, and persisted if asked, while mute stays as it is: a client saving its
+settings uses this so it doesn't unmute the speaker. While muted the output
+stays silent and the new volume applies on unmute. The result and the
+`audio.volume` event are as before; `muted` says which way it went.
+
 ### System
 
 | Verb | Args | Result |
@@ -378,12 +412,35 @@ with no visible cause looks broken to anyone without a shell.
 `confirm` is required and has **no default**: a caller that forgets it gets
 `INVALID_ARGS` rather than a powered-off robot.
 
-Before going down the daemon stops the flippers, releases calibration holds,
-turns the ring off and notifies the panel. It then answers the caller and
-schedules the actual call `delay_s` later (default 2 s), so the reply reaches
-the client before the network drops.
+The daemon asks logind first (`system.power_status`). If it may not, the
+reply is `{"scheduled": false, ...}` with the `system.power_status` fields,
+and nothing else happens: flippers, ring and screen are left alone and no
+`system.*` event is published.
+
+If it may, it stops the flippers (cancelling any ramp, and publishing
+`flipper.<id>.state`), releases calibration holds, turns the ring
+off and blanks the screen (`screen:off`; firmware that predates it gets
+`pause`, `clear`, `led:off`), then publishes `{"pending": true}`. It then
+answers the caller and schedules the actual call `delay_s` later (default
+2 s), so the reply reaches the client before the network drops.
+
+If logind then refuses the call itself (after the reply was sent), the robot
+stays up. The daemon wakes the screen (`screen:on` and `resume`) and publishes
+a second `system.poweroff` / `system.reboot` event:
+`{"scheduled": false, "failed": true, "reason": "..."}`. Flippers, holds and
+the ring stay stopped.
+
+The panel's power buttons take the same path with the default delay. A
+refused press publishes nothing; an allowed one publishes `{"pending": true}`
+and then the scheduled result.
 
 Requires the polkit rule. Without it, `allowed` is false and `reason` says why.
+
+On the fake backend power is simulated and never reaches logind:
+`system.power_status` says allowed, and a request logs
+`fake backend: would power off` (or `reboot`) and gives the normal
+`{"scheduled": true, ...}` reply, with the same flipper, ring, screen and event
+side effects. Nothing happens to the machine.
 
 ---
 
@@ -404,7 +461,8 @@ Requires the polkit rule. Without it, `allowed` is false and `reason` says why.
 | `audio.volume` | `{"volume", "index", "muted", ...}` |
 | `audio.mute` | `{"muted", "volume"}` |
 | `audio.mic_mute` | `{"mic_muted", "controls"}` |
-| `system.poweroff` / `system.reboot` | `{"pending": true}` |
+| `system.poweroff` / `system.reboot` | `{"pending": true}`, or `{"scheduled": false, "failed": true, "reason"}` if logind refuses after scheduling |
+| `cyd.state` | `{"mood", "cycle", "bright", "auto_bright", "reports"}`; see below |
 
 `source: "cyd"`:
 
@@ -413,6 +471,37 @@ Requires the polkit rule. Without it, `allowed` is false and `reason` says why.
 | `host_vol` | `{"value": 0..100}` |
 | `host_mute` / `host_mic` | `{}` |
 | `host_reboot` / `host_poweroff` | `{}` |
+| `host_ready` | `{}` |
+
+The screen's report lines (`host_face`, `host_cycle`, `host_bright`,
+`host_auto_bright`) are **not** published as events: a cycling screen sends a
+face every few seconds and would fill the 256-event history. They update
+`cyd.state`, which is.
+
+### `cyd.state`
+
+The face, cycling, brightness and auto-brightness belong to the screen; the
+host records what it reports and passes it on. Published only when a value
+changes.
+
+```json
+{"mood": "HAPPY", "cycle": false, "bright": 60, "auto_bright": false, "reports": true}
+```
+
+| Field | Values |
+|---|---|
+| `mood` | One of the ten `cyd.mood` names, `"CUSTOM"` after `face`, or `null` |
+| `cycle` | `true` while the screen cycles moods, or `null` |
+| `bright` | The brightness setting, 0..100, or `null`. Not auto-brightness's own changes |
+| `auto_bright` | bool or `null` |
+| `reports` | `false` until the firmware sends a report line or `host_ready`. While false, the other fields are only what the host last sent |
+
+`null` means not known. The report lines behind it never make the host write
+to the screen.
+
+`host_ready` means the screen restarted. The host turns state push on (even if
+the start-up probe timed out) and pushes volume, mute and mic mute again,
+publishing no audio event since nothing changed on the host.
 
 Panel actions produce **both**: the `cyd` event recording what arrived, and the
 matching `host` event recording what the daemon did about it. A client tracking

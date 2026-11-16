@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from rsc_host.config import AudioSettings, RingSettings, SerialSettings, ServoSettings
 from rsc_host.errors import PeripheralUnavailableError
@@ -102,6 +104,8 @@ class Peripherals:
     cyd: CydBridge
     audio: Audio
     motion: MotionOwners
+    # power.LogindPower on the Pi, power.FakePower on the fake backend.
+    power: power.LogindPower | power.FakePower
     cyd_control_task: asyncio.Task | None = None
 
     async def stop(self) -> None:
@@ -342,6 +346,19 @@ class _AudioSelftestArgs(BaseModel):
         ),
     )
 
+    @field_validator("path")
+    @classmethod
+    def _wav_in_tmp(cls, path: str) -> str:
+        # Any client can call this verb, and the daemon's own folders will soon
+        # hold chats and logs. A .wav directly inside /tmp is all it needs.
+        p = PurePosixPath(path)
+        if p.parent != _SELFTEST_DIR or p.suffix != ".wav" or p.stem in ("", "."):
+            raise ValueError("path must be a .wav file directly inside /tmp")
+        return path
+
+
+_SELFTEST_DIR = PurePosixPath("/tmp")
+
 
 class _ServoCalibrationArgs(BaseModel):
     """Read calibration. Omit ``id`` for every servo."""
@@ -427,6 +444,9 @@ class _MixerSetArgs(BaseModel):
 class _VolumeArgs(BaseModel):
     percent: int = Field(ge=0, le=100)
     persist: bool = False
+    # False sets (and persists) the volume without touching mute, so a client
+    # saving its settings doesn't unmute the speaker.
+    unmute: bool = True
 
 
 class _MuteArgs(BaseModel):
@@ -471,7 +491,7 @@ async def _cyd_control_loop(
     # — so the same state change would carry two different topic names
     # depending on which surface caused it, and a client watching one would
     # silently miss the other.
-    handlers: dict[str, tuple[str, object]] = {
+    handlers: dict[str, tuple[str | None, object]] = {
         "host_vol": (
             "audio.volume",
             lambda data: audio_be.set_volume(int(data.get("value", 0))),
@@ -487,6 +507,9 @@ async def _cyd_control_loop(
             lambda _data: _power_from_panel("poweroff"),
         ),
         "host_reboot": ("system.reboot", lambda _data: _power_from_panel("reboot")),
+        # The screen restarted and shows nothing definite. Push the audio state
+        # again; nothing changed on the host, so no event goes out.
+        "host_ready": (None, lambda _data: _audio_state(audio_be)),
     }
     async with bus.subscribe() as queue:
         while True:
@@ -504,6 +527,8 @@ async def _cyd_control_loop(
                 # person pressing it has no console to read a traceback from.
                 log.exception("cyd control %s failed", event.topic)
                 continue
+            if result is None:
+                continue  # nothing happened, e.g. a refused shutdown
             # Push back even though the press came from the panel. Its mute
             # flags are its own and it flips them blind, so after a press the
             # two sides may disagree; this is where that gets corrected.
@@ -512,17 +537,36 @@ async def _cyd_control_loop(
                 muted=result.get("muted"),
                 mic_muted=result.get("mic_muted"),
             )
-            await bus.publish(
-                Event(topic=topic, source="host", data=dict(result))
-            )
+            if topic is not None:
+                await bus.publish(
+                    Event(topic=topic, source="host", data=dict(result))
+                )
 
 
-def _make_power_from_panel(prepare):
-    """Bind the panel's power requests to the same path the verbs use."""
-    async def _power_from_panel(action: str) -> dict:
-        await prepare(action)
-        return await power.request(action)
+def _make_power_from_panel(power_change):
+    """Bind the panel's power requests to the same path the verbs use.
+
+    A refusal returns None, so the control loop publishes nothing: the robot
+    did not change, and an event would tell every console it had.
+    """
+    async def _power_from_panel(action: str) -> dict | None:
+        result = await power_change(action, power.DEFAULT_DELAY)
+        if not result.get("scheduled"):
+            log.warning("panel %s refused: %s", action, result.get("reason"))
+            return None
+        return result
     return _power_from_panel
+
+
+async def _audio_state(audio_be: AudioBackend) -> dict:
+    """Volume, mute and mic mute, in the keys ``CydBridge.push_state`` reads."""
+    volume = await audio_be.get_volume()
+    mic = await audio_be.get_mic_mute()
+    return {
+        "volume": volume.get("volume"),
+        "muted": volume.get("muted"),
+        "mic_muted": mic.get("mic_muted"),
+    }
 
 
 async def _toggle_mute(audio_be: AudioBackend) -> dict:
@@ -532,8 +576,8 @@ async def _toggle_mute(audio_be: AudioBackend) -> dict:
 
 
 async def _toggle_mic(audio_be: AudioBackend) -> dict:
-    muted = bool(getattr(audio_be, "_mic_muted", False))
-    return await audio_be.set_mic_mute(not muted)
+    current = await audio_be.get_mic_mute()
+    return await audio_be.set_mic_mute(not current.get("mic_muted", False))
 
 
 async def setup(
@@ -590,6 +634,9 @@ async def setup(
     )
     for be in (servo_be, ring_be, gpio_in_be, gpio_pwm_be, serial_be, audio_be):
         await be.start()
+    # Shutdown follows the backend too: the fake one never calls busctl, so a
+    # laptop session cannot power off the laptop.
+    power_ctl = power.FakePower() if backend == "fake" else power.LogindPower()
 
     # Peripherals
     flipper_left = Flipper("left", servo_be, bus)
@@ -604,10 +651,20 @@ async def setup(
 
     await button.start()
     await cyd.start()
-    # Ask the panel whether it can be told about volume state. Current firmware
+    # Ask the panel whether it can be told about volume state. Old firmware
     # cannot, and says so; the daemon carries on either way and enables itself
-    # the moment patched firmware appears, with no config to remember.
+    # the moment new firmware appears (here or on host_ready), with no config
+    # to remember.
     await cyd.probe_push_support()
+    # Firmware keeps no copy of these, so it shows nothing definite until told.
+    # The backends have already restored a saved volume by this point. A no-op
+    # on old firmware.
+    await cyd.push_state(**await _audio_state(audio_be))
+    # A shutdown blanks the screen, and the screen stays powered through a
+    # reboot. Then ask what it shows rather than setting a face: the face is
+    # the screen's to keep.
+    await cyd.screen_on()
+    await cyd.request_report()
 
     flippers = {
         "left": flipper_left,
@@ -746,8 +803,8 @@ async def setup(
     def register_cyd(verb_name: str) -> None:
         @dispatcher.verb(verb_name, args_model=_CydCuratedArgs)
         async def _handler(args: _CydCuratedArgs) -> dict:
-            await cyd.send_curated(verb_name, args.value)
-            return {"verb": verb_name, "value": args.value}
+            sent = await cyd.send_curated(verb_name, args.value)
+            return {"verb": verb_name, "value": sent}
 
     for verb_name in curated_cyd_verbs():
         register_cyd(verb_name)
@@ -850,7 +907,12 @@ async def setup(
             pcm = pcm[skip:]
 
         def _write_and_measure() -> dict:
-            with wave.open(args.path, "wb") as w:
+            # O_NOFOLLOW: /tmp is shared, and a link planted at the path must
+            # not turn this write into one somewhere else.
+            fd = os.open(
+                args.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+            )
+            with os.fdopen(fd, "wb") as fh, wave.open(fh, "wb") as w:
                 w.setnchannels(channels)
                 w.setsampwidth(width)
                 w.setframerate(rate)
@@ -992,9 +1054,9 @@ async def setup(
 
     # ---- Volume ----
 
-    async def _apply_volume(percent: int, persist: bool) -> dict:
-        result = await audio_be.set_volume(percent, persist=persist)
-        await cyd.push_state(volume=result.get("volume"), muted=False)
+    async def _apply_volume(percent: int, persist: bool, unmute: bool) -> dict:
+        result = await audio_be.set_volume(percent, persist=persist, unmute=unmute)
+        await cyd.push_state(volume=result.get("volume"), muted=result.get("muted"))
         await bus.publish(
             Event(topic="audio.volume", source="host", data=dict(result))
         )
@@ -1005,9 +1067,9 @@ async def setup(
         """Set output volume, 0..100, where 100 is 0 dB.
 
         ``persist`` keeps it across a restart; without it the setting lasts
-        until the daemon stops.
+        until the daemon stops. ``unmute: false`` leaves mute as it is.
         """
-        return await _apply_volume(args.percent, args.persist)
+        return await _apply_volume(args.percent, args.persist, args.unmute)
 
     @dispatcher.verb("audio.volume.get", args_model=_EmptyArgs)
     async def _audio_volume_get(_args: _EmptyArgs) -> dict:
@@ -1057,36 +1119,70 @@ async def setup(
             except Exception:
                 log.warning("pre-%s: %s failed", action, what, exc_info=True)
 
-        await _try("stop flippers", servo_be.stop_all())
-        await _try("release holds", servo_be.release_hold())
+        # Through the stop verbs' path, so a running ramp is cancelled (it
+        # would otherwise drive the servo again) and each flipper publishes
+        # its state. Then cease every pulse train, as before.
+        for flipper in flippers.values():
+            await _try(f"stop flipper {flipper.id}", _stop_flipper(flipper))
+        await _try("stop servos", servo_be.stop_all())
+
+        async def _release_holds() -> None:
+            with motion.hold_stopped(None):
+                await servo_be.release_hold()
+
+        await _try("release holds", _release_holds())
         await _try("ring off", ring.set_mode("off"))
-        # Tell the panel something is happening. It has no other way to know,
-        # and a face still animating through a shutdown looks like a crash.
-        await _try("cyd notice", cyd.send_curated("cyd.mood", "SAD"))
+        # A dark screen says the robot is going down; a face still animating
+        # through a shutdown looks like a crash. Not a mood: that would be
+        # saved on the screen and still showing after the reboot.
+        await _try("screen off", cyd.screen_off())
         await bus.publish(
             Event(topic=f"system.{action}", source="host", data={"pending": True})
         )
 
+    async def _power_change(action: str, delay_s: float) -> dict:
+        """Ask first, then make the hardware safe, then go down.
+
+        A refusal returns logind's answer and touches nothing, so a robot
+        whose polkit rule is missing does not look as if it is shutting down.
+        """
+        allowed = await power_ctl.status()
+        if not allowed["allowed"]:
+            return {"scheduled": False, **allowed}
+        await _prepare_for_power_change(action)
+
+        async def _failed(reason: str) -> None:
+            # logind said no after the caller was told yes: the robot stays up.
+            # Light the screen again and tell every console it isn't going down.
+            await cyd.screen_on()
+            await bus.publish(
+                Event(
+                    topic=f"system.{action}",
+                    source="host",
+                    data={"scheduled": False, "failed": True, "reason": reason},
+                )
+            )
+
+        return await power_ctl.request(action, delay_s, on_failure=_failed)
+
     @dispatcher.verb("system.power_status", args_model=_EmptyArgs)
     async def _system_power_status(_args: _EmptyArgs) -> dict:
         """Whether the daemon may power the machine down, and why not if not."""
-        return await power.status()
+        return await power_ctl.status()
 
     @dispatcher.verb("system.poweroff", args_model=_PowerArgs)
     async def _system_poweroff(args: _PowerArgs) -> dict:
         """Shut the robot down. Requires ``confirm: true``."""
         if not args.confirm:
             raise ValueError("poweroff requires confirm:true")
-        await _prepare_for_power_change("poweroff")
-        return await power.request("poweroff", args.delay_s)
+        return await _power_change("poweroff", args.delay_s)
 
     @dispatcher.verb("system.reboot", args_model=_PowerArgs)
     async def _system_reboot(args: _PowerArgs) -> dict:
         """Reboot the robot. Requires ``confirm: true``."""
         if not args.confirm:
             raise ValueError("reboot requires confirm:true")
-        await _prepare_for_power_change("reboot")
-        return await power.request("reboot", args.delay_s)
+        return await _power_change("reboot", args.delay_s)
 
     @dispatcher.verb("peripherals.status", args_model=_EmptyArgs)
     async def _peripherals_status(_args: _EmptyArgs) -> dict:
@@ -1128,6 +1224,10 @@ async def setup(
                 # guess and will drift from the host. Visible here so the
                 # disagreement is diagnosable rather than merely confusing.
                 "state_push": cyd.supports_push,
+                # False means the firmware never reports, so ``state`` is only
+                # what the host last sent. Same object as cyd.state's data.
+                "reports": cyd.reports,
+                "state": cyd.snapshot(),
             },
             "audio": {
                 "capturing": audio.is_capturing,
@@ -1157,7 +1257,7 @@ async def setup(
     # the peripherals work, and Peripherals.stop() owns its cancellation.
     control_task = asyncio.create_task(
         _cyd_control_loop(
-            bus, audio_be, cyd, _make_power_from_panel(_prepare_for_power_change)
+            bus, audio_be, cyd, _make_power_from_panel(_power_change)
         ),
         name="cyd-control",
     )
@@ -1178,5 +1278,6 @@ async def setup(
         cyd=cyd,
         audio=audio,
         motion=motion,
+        power=power_ctl,
         cyd_control_task=control_task,
     )
