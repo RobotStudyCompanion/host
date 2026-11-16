@@ -182,7 +182,7 @@ class ServoCalibration:
         }
 
 
-#: Measured on the RSC chassis. Right is provisional — see the handover notes.
+#: Measured on the RSC chassis. Right is provisional — see docs/configuration.md.
 DEFAULT_CALIBRATION: dict[str, ServoCalibration] = {
     "left":  ServoCalibration(null_us=1495, span_us=100, invert=False),
     "right": ServoCalibration(null_us=1510, span_us=205, invert=True),

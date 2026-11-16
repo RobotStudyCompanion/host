@@ -6,11 +6,7 @@ One-time steps to bring an RSC Pi from a fresh Raspberry Pi OS install to a
 Assumes Raspberry Pi OS Trixie or newer on a Pi 4, user `rsc`, the RSC
 Power/Peripheral HAT fitted, and a ReSpeaker 2-Mic HAT for audio.
 
-> **Do not install or enable pigpiod.** An earlier version of this document
-> told you to, and that was the cause of the timing problems that were once
-> blamed on the hardware. See [Why not pigpio](#why-not-pigpio) below. If
-> `pigpiod` is present on a machine you are fixing rather than building, mask
-> it: `sudo systemctl mask pigpiod`.
+> **Do not install or enable pigpiod.** See [Why not pigpio](#why-not-pigpio). If it is present, mask it: sudo systemctl mask pigpiod. If `pigpiod` is present on a machine you are fixing rather than building, mask it: `sudo systemctl mask pigpiod`.
 
 ## 1. System packages
 
@@ -239,18 +235,14 @@ Then connect the web console and try a flipper, the ring, and
 
 ## Why not pigpio
 
-A previous investigation concluded that the Pi could not drive the servos, the
-ring and I2S audio concurrently, and that an RP2350 co-processor was needed.
-That conclusion was wrong.
-
+Under pigpio, the servos, the ring and I2S audio could not run concurrently.
 The cause was `pigpiod` running from a malformed unit: a second `[Service]`
-block appended to the file, with `ExecStop=/bin/systemctl kill pigpiod`: which
+block appended to the file, with `ExecStop=/bin/systemctl kill pigpiod`, which
 kills its own calling transaction, exits `255/EXCEPTION`, and leaves DMA
 channels and the PWM peripheral unrestored. Everything downstream inherited the
 wreckage.
 
-With pigpio masked and everything on lgpio, all peripherals run concurrently,
-first time. No co-processor is required.
+With pigpio masked and everything on lgpio, all peripherals run concurrently.
 
 lgpio has two traps that pigpio did not:
 
